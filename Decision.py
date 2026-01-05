@@ -20,9 +20,9 @@ class DecisionNode:
         
         # --- 데이터 저장 변수 ---
         self.lane_coeffs = None
+        self.obs_coeffs = None
         self.stop_line_status = "NONE"
         self.traffic_light = "UNKNOWN"
-        self.obstacles = []
         self.ar_tag = None # [ID, Distance, Angle]
         
         self.stop_line_count = 0
@@ -36,13 +36,13 @@ class DecisionNode:
         rospy.Subscriber("/lane_coeffs", Float32MultiArray, self.lane_cb)
         rospy.Subscriber("/stop_line_status", String, self.stop_line_cb)
         rospy.Subscriber("/traffic_light_status", String, self.light_cb)
-        rospy.Subscriber("/detected_obstacles", Float32MultiArray, self.obs_cb)
+        rospy.Subscriber("/obs_coeffs", Float32MultiArray, self.obs_cb)
         rospy.Subscriber("/ar_tag_info", Float32MultiArray, self.ar_cb)
 
     # --- 콜백 함수들 ---
     def lane_cb(self, msg): self.lane_coeffs = msg.data
     def light_cb(self, msg): self.traffic_light = msg.data
-    def obs_cb(self, msg): self.obstacles = msg.data
+    def obs_cb(self, msg): self.obs_coeffs = msg.data
     def ar_cb(self, msg): self.ar_tag = msg.data
 
     def stop_line_cb(self, msg):
@@ -55,12 +55,16 @@ class DecisionNode:
 
     # --- 제어 로직 ---
     # 차선 계수를 이용한 목표 조향각 계산 (단순화된 PID)
-    def get_steer_from_lane(self):
-        if self.lane_coeffs is None or len(self.lane_coeffs) < 6:
+    def get_steer_from_lane(self, is_obstacle):
+        if is_obstacle:
+            path_coffs = self.obs_coeffs
+        else:
+            path_coffs = self.lane_coeffs
+        if path_coffs is None or len(path_coffs) < 6:
             return 90
         # 차선 중앙점 계산 (y=400 지점의 x값 사용)
-        l_a, l_b, l_c = self.lane_coeffs[0:3]
-        r_a, r_b, r_c = self.lane_coeffs[3:6]
+        l_a, l_b, l_c = path_coffs[0:3]
+        r_a, r_b, r_c = path_coffs[3:6]
         y_eval = 400
         center_x = ((l_a*y_eval**2 + l_b*y_eval + l_c) + (r_a*y_eval**2 + r_b*y_eval + r_c)) / 2
         error = center_x - 320 # 640 해상도 기준 중앙 오차
@@ -72,16 +76,30 @@ class DecisionNode:
             steer = 90
             speed = 90 
 
-            # --- [UC8] 트랙 주행 시나리오 제어 ---
-            
-            # [UC1] 1차 노란색 실선 정지 및 출발
-            if self.current_state == self.STATE_START_WAIT:
-                # UC1-5: 출발 시 기본 방향을 오른쪽 레인으로 설정
-                self.mission_direction_pub.publish("RIGHT") 
-                speed = 100 
-                self.current_state = self.STATE_YELLOW_STOP_1
+        # --- [UC8] 트랙 주행 시나리오 제어 ---
+        
+        # [UC1] 1차 노란색 실선 정지 및 출발
+        if self.current_state == self.STATE_START_WAIT:
+            # UC1-5: 출발 시 기본 방향을 오른쪽 레인으로 설정
+            self.mission_direction_pub.publish("RIGHT") 
+            speed = 100 
+            self.current_state = self.STATE_YELLOW_STOP_1
 
-            elif self.current_state == self.STATE_YELLOW_STOP_1:
+        elif self.current_state == self.STATE_YELLOW_STOP_1:
+            if self.stop_line_status == "YELLOW":
+                speed = 90
+                self.mission_status_pub.publish("STOP")
+                # UC1-4: 신호등 초록불 인지 시 출발
+                if self.traffic_light == "GREEN":
+                    self.current_state = self.STATE_LANE_FOLLOW
+            else:
+                speed = 98; steer = self.get_steer_from_lane()
+
+        # [UC2, UC3] 레인 주행 및 콘 장애물 회피
+        elif self.current_state == self.STATE_LANE_FOLLOW:
+            speed = 100; steer = self.get_steer_from_lane(len(self.obs_coeffs))
+
+            if self.current_state == self.STATE_YELLOW_STOP_1:
                 if self.stop_line_status == "YELLOW":
                     speed = 90
                     self.mission_status_pub.publish("STOP")

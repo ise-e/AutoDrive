@@ -176,17 +176,16 @@ class IntegratedPerception:
         frame = cv2.resize(frame, (640, 480))
         blur = cv2.GaussianBlur(frame, (5, 5), 0)
         
-        # 2. 각 알고리즘에 필요한 변환본 생성
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+        # 2. 각 알고리즘에 필요한 변환본 생성과 프로세스 실행
         bev = cv2.warpPerspective(blur, self.M, (640, 480))
-        
         self.process_lanes_and_stopline(bev)
-        
-        # 3. 개별 프로세스 실행
+
         if self.current_mission_status == "STOP":
+            hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
             self.process_traffic_light(hsv)
+            
         if self.current_mission_status == "PARKING":
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             self.process_ar_tag(gray)
 
 if __name__ == '__main__':

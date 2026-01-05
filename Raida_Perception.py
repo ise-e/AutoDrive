@@ -14,7 +14,7 @@ class ObstacleDetector:
         self.distance_threshold = 0.1  # 같은 물체로 판단할 점들 사이의 최대 거리 (m)
         self.min_cluster_size = 3      # 유효한 물체로 볼 최소 점 개수
         self.max_cluster_size = 30     # 라바콘 크기를 고려한 최대 점 개수
-        [cite_start]self.roi_front_limit = 3.0     # 전방 탐색 제한 거리 (m) 
+        self.roi_front_limit = 3.0     # 전방 탐색 제한 거리 (m) 
 
     # 라이다 데이터를 처리하여 클러스터링 수행
     def scan_callback(self, msg):
@@ -27,7 +27,7 @@ class ObstacleDetector:
                 continue
         
             angle = msg.angle_min + i * msg.angle_increment
-            # [cite_start]전방 180도만 처리 (ROI 설정) [cite: 27]
+            # 전방 180도만 처리 (ROI 설정) [cite: 27]
             if -math.pi/2 < angle < math.pi/2:
                 x = r * math.cos(angle)
                 y = r * math.sin(angle)

@@ -4,7 +4,7 @@ from std_msgs.msg import String, Int16MultiArray, Float32MultiArray
 
 class DecisionNode:
     def __init__(self):
-        rospy.init_node('decision_node')
+        # rospy.init_node('decision_node') # runtime_node에서 초기화하므로 삭제함
 
         # --- 상태 정의 (UC8 기준) ---
         self.STATE_START_WAIT = 0   # 출발 대기
@@ -66,80 +66,72 @@ class DecisionNode:
         error = center_x - 320 # 640 해상도 기준 중앙 오차
         return int(90 + (error * 0.15)) # Kp 게인 조절 필요
 
-    def run(self):
-        rate = rospy.Rate(30)
-        while not rospy.is_shutdown():
-            steer = 90
-            speed = 90 
+    def step(self):
+        steer = 90
+        speed = 90 
 
-            # --- [UC8] 트랙 주행 시나리오 제어 ---
-            
-            # [UC1] 1차 노란색 실선 정지 및 출발
-            if self.current_state == self.STATE_START_WAIT:
-                # UC1-5: 출발 시 기본 방향을 오른쪽 레인으로 설정
-                self.mission_direction_pub.publish("RIGHT") 
-                speed = 100 
-                self.current_state = self.STATE_YELLOW_STOP_1
+        # --- [UC8] 트랙 주행 시나리오 제어 ---
+        
+        # [UC1] 1차 노란색 실선 정지 및 출발
+        if self.current_state == self.STATE_START_WAIT:
+            # UC1-5: 출발 시 기본 방향을 오른쪽 레인으로 설정
+            self.mission_direction_pub.publish("RIGHT") 
+            speed = 100 
+            self.current_state = self.STATE_YELLOW_STOP_1
 
-            elif self.current_state == self.STATE_YELLOW_STOP_1:
-                if self.stop_line_status == "YELLOW":
-                    speed = 90
-                    self.mission_status_pub.publish("STOP")
-                    # UC1-4: 신호등 초록불 인지 시 출발
-                    if self.traffic_light == "GREEN":
-                        self.current_state = self.STATE_LANE_FOLLOW
-                else:
-                    speed = 98; steer = self.get_steer_from_lane()
-
-            # [UC2, UC3] 레인 주행 및 콘 장애물 회피
-            elif self.current_state == self.STATE_LANE_FOLLOW:
-                speed = 100; steer = self.get_steer_from_lane()
-                
-                # [UC3] 장애물 회피 (라이다 데이터 활용)
-                if len(self.obstacles) >= 3:
-                    x, y = self.obstacles[0], self.obstacles[1]
-                    dist = np.sqrt(x**2 + y**2)
-                    if dist < 1.0:
-                        steer += 25
-
-                # [UC4] 1차 흰색 실선 감지 (한바퀴 순환)
-                if self.stop_line_status == "WHITE" and self.stop_line_count == 1:
-                    rospy.loginfo("UC4: First Lap Completed. Repeat Lane Follow.")
-                    self.mission_direction_pub.publish("RIGHT") # 계속 오른쪽 레인 유지
-
-                # [UC5] 2차 흰색 실선 감지 (왼쪽 진입)
-                if self.stop_line_status == "WHITE" and self.stop_line_count == 2:
-                    rospy.loginfo("UC5: Second White Line. Transition to LEFT Lane.")
-                    self.mission_direction_pub.publish("LEFT") # 왼쪽 레인 진입 명령
-                    self.current_state = self.STATE_WHITE_COUNT_2
-
-            # [UC6] 2차 노란색 실선 감지
-            elif self.current_state == self.STATE_WHITE_COUNT_2:
+        elif self.current_state == self.STATE_YELLOW_STOP_1:
+            if self.stop_line_status == "YELLOW":
+                speed = 90
+                self.mission_status_pub.publish("STOP")
+                # UC1-4: 신호등 초록불 인지 시 출발
+                if self.traffic_light == "GREEN":
+                    self.current_state = self.STATE_LANE_FOLLOW
+            else:
                 speed = 98; steer = self.get_steer_from_lane()
-                if self.stop_line_status == "YELLOW":
-                    speed = 90
-                    self.mission_status_pub.publish("STOP")
-                    # UC6-4: 초록불 대기
-                    if self.traffic_light == "GREEN":
-                        self.current_state = self.STATE_PARKING
-                        self.mission_status_pub.publish("PARKING")
 
-            # [UC7] AR 태그 인식 주차
-            elif self.current_state == self.STATE_PARKING:
-                if self.ar_tag is not None:
-                    id, dist, angle = self.ar_tag[0:3]
-                    if dist > 0.3:
-                        speed = 95; steer = 90 + int(np.degrees(angle))
-                    else:
-                        speed = 90
-                        rospy.loginfo("UC7: Parking Completed.")
-                        self.current_state = self.STATE_FINISH
-
-            # 최종 명령 발행
-            self.motor_pub.publish(Int16MultiArray(data=[steer, speed]))
-            rate.sleep()
+        # [UC2, UC3] 레인 주행 및 콘 장애물 회피
+        elif self.current_state == self.STATE_LANE_FOLLOW:
+            speed = 100; steer = self.get_steer_from_lane()
             
+            # [UC3] 장애물 회피 (라이다 데이터 활용)
+            if len(self.obstacles) >= 3:
+                x, y = self.obstacles[0], self.obstacles[1]
+                dist = np.sqrt(x**2 + y**2)
+                if dist < 1.0:
+                    steer += 25
 
-if __name__ == '__main__':
-    node = DecisionNode()
-    node.run()
+            # [UC4] 1차 흰색 실선 감지 (한바퀴 순환)
+            if self.stop_line_status == "WHITE" and self.stop_line_count == 1:
+                rospy.loginfo("UC4: First Lap Completed. Repeat Lane Follow.")
+                self.mission_direction_pub.publish("RIGHT") # 계속 오른쪽 레인 유지
+
+            # [UC5] 2차 흰색 실선 감지 (왼쪽 진입)
+            if self.stop_line_status == "WHITE" and self.stop_line_count == 2:
+                rospy.loginfo("UC5: Second White Line. Transition to LEFT Lane.")
+                self.mission_direction_pub.publish("LEFT") # 왼쪽 레인 진입 명령
+                self.current_state = self.STATE_WHITE_COUNT_2
+
+        # [UC6] 2차 노란색 실선 감지
+        elif self.current_state == self.STATE_WHITE_COUNT_2:
+            speed = 98; steer = self.get_steer_from_lane()
+            if self.stop_line_status == "YELLOW":
+                speed = 90
+                self.mission_status_pub.publish("STOP")
+                # UC6-4: 초록불 대기
+                if self.traffic_light == "GREEN":
+                    self.current_state = self.STATE_PARKING
+                    self.mission_status_pub.publish("PARKING")
+
+        # [UC7] AR 태그 인식 주차
+        elif self.current_state == self.STATE_PARKING:
+            if self.ar_tag is not None:
+                id, dist, angle = self.ar_tag[0:3]
+                if dist > 0.3:
+                    speed = 95; steer = 90 + int(np.degrees(angle))
+                else:
+                    speed = 90
+                    rospy.loginfo("UC7: Parking Completed.")
+                    self.current_state = self.STATE_FINISH
+
+        # 최종 명령 발행
+        return int(steer), int(speed)

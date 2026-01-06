@@ -189,7 +189,6 @@ class CameraPerception:
     # ---------------- algorithms (원본 로직 유지) ----------------
     def _lane_stop(self, bev):
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
-
         ymask = cv2.inRange(hsv, *self.YELLOW)
 
         if self.adapt_white:
@@ -199,7 +198,7 @@ class CameraPerception:
             wmask = cv2.inRange(hsv, w_low, self.WHITE[1])
         else:
             wmask = cv2.inRange(hsv, *self.WHITE)
-        
+
         h, w = ymask.shape
         y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
         if y1 <= y0:

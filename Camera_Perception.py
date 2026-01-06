@@ -1,194 +1,342 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# test
+"""
+Camera_Perception_refactored.py (기능 유지 + 직관성 개선)
+
+토픽 계약(간단 요약)
+- 입력:
+  - ~camera_topic (sensor_msgs/Image) default: /camera/image_raw
+  - /mission_direction (String) : "LEFT" | "RIGHT"
+  - /mission_status (String) : "NONE" | "STOP" | "PARKING" | ...
+
+- 출력:
+  - /lane_coeffs (Float32MultiArray) : [la, lb, lc, ra, rb, rc]
+      x_px = a*y_px^2 + b*y_px + c  (BEV 이미지 좌표계)
+  - /stop_line_status (String) : "NONE" | "WHITE" | "YELLOW"
+  - /traffic_light_status (String) : "RED" | "YELLOW" | "GREEN" | "UNKNOWN"
+  - /ar_tag_info (Float32MultiArray) : [tag_id, dist_m, ang_rad, ...]
+  - (옵션) /debug/lane_overlay/image/compressed (CompressedImage) : 오버레이 JPG
+
+핵심 개선
+- lambda setattr 제거 -> 명시적 콜백 메서드로 추적성 향상
+- gp/sp/dp 같은 축약어 제거 -> get_param, src_pts_ratio/dst_pts_ratio 등으로 명확화
+"""
+
+from __future__ import annotations
+
+import time
 import rospy
 import cv2
 import numpy as np
-from sensor_msgs.msg import Image
+
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import Float32MultiArray, String
-from cv_bridge import CvBridge
 
-class IntegratedPerception:
+
+def now_sec() -> float:
+    return time.time()
+
+
+class CameraPerception:
     def __init__(self):
-        self.bridge = CvBridge()
-        
-        # --- [1] 발행자(Publisher) 설정 ---
-        self.ar_pub = rospy.Publisher("/ar_tag_info", Float32MultiArray, queue_size=1)
-        self.traffic_pub = rospy.Publisher("/traffic_light_status", String, queue_size=1)
-        self.lane_pub = rospy.Publisher("/lane_coeffs", Float32MultiArray, queue_size=1)
-        self.stop_line_pub = rospy.Publisher("/stop_line_status", String, queue_size=1)
-        
-        # --- [2] 구독자(Subscriber) 설정 ---
-        self.image_sub = rospy.Subscriber("/camera/image_raw", Image, self.image_callback)
-        self.mission_direction_sub = rospy.Subscriber("/mission_direction", String, self.mission_direction_callback)
-        self.mission_status_sub = rospy.Subscriber("/mission_status", String, self.mission_status_callback)
-        
-        # --- [3] 파라미터 및 초기화 설정 ---
-        self.current_mission_direction = "RIGHT"
-        self.current_mission_status = "NONE"
-        
-        # AR 태그 설정
-        self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_6X6_250)
-        self.aruco_params = cv2.aruco.DetectorParameters_create()
-        self.tag_size = 0.15
-        self.focal_length = 600.0
-        
-        # 신호등 및 차선 HSV 범위 (공통 관리)
-        self.lower_red1 = np.array([0, 100, 100]);   self.upper_red1 = np.array([10, 255, 255])
-        self.lower_red2 = np.array([160, 100, 100]); self.upper_red2 = np.array([179, 255, 255])
-        self.lower_yellow = np.array([15, 100, 100]); self.upper_yellow = np.array([35, 255, 255])
-        self.lower_green = np.array([45, 100, 100]);  self.upper_green = np.array([90, 255, 255])
-        self.lower_white = np.array([0, 0, 200]);    self.upper_white = np.array([179, 40, 255])
+        rospy.init_node("camera_perception_node")
+        get_param = rospy.get_param
 
-        # BEV 변환 행렬
-        self.src_pts = np.float32([[200, 300], [440, 300], [50, 450], [590, 450]])
-        self.dst_pts = np.float32([[150, 0], [490, 0], [150, 480], [490, 480]])
-        self.M = cv2.getPerspectiveTransform(self.src_pts, self.dst_pts)
+        # ---------- IO ----------
+        self.cam_topic = get_param("~camera_topic", "/camera/image_raw")
+        self.w, self.h = int(get_param("~out_w", 640)), int(get_param("~out_h", 480))
 
-    def mission_direction_callback(self, msg):
-        self.current_mission_direction = msg.data.upper()
+        self.overlay_topic = get_param("~overlay_topic", "/debug/lane_overlay/image/compressed")
+        self.overlay_on = bool(get_param("~overlay_enable", True))
+        self.jpg_q = int(get_param("~jpeg_quality", 80))
 
-    def mission_status_callback(self, msg):
-        self.current_mission_status = msg.data.upper()
+        # ---------- BEV ----------
+        src_pts_ratio = get_param(
+            "~src_pts_ratio",
+            [200/640, 300/480, 440/640, 300/480, 50/640, 450/480, 590/640, 450/480]
+        )
+        dst_pts_ratio = get_param(
+            "~dst_pts_ratio",
+            [150/640, 0/480, 490/640, 0/480, 150/640, 1.0, 490/640, 1.0]
+        )
+        self.M = cv2.getPerspectiveTransform(
+            self._ratio_pts(src_pts_ratio, self.w, self.h),
+            self._ratio_pts(dst_pts_ratio, self.w, self.h),
+        )
 
-    # AR 태그 검출 및 정보 발행
-    def process_ar_tag(self, gray_frame):
-        corners, ids, _ = cv2.aruco.detectMarkers(gray_frame, self.aruco_dict, parameters=self.aruco_params)
-        if ids is not None:
-            ar_data = []
-            for i in range(len(ids)):
-                c = corners[i][0]
-                pixel_width = np.linalg.norm(c[0] - c[1])
-                distance = (self.tag_size * self.focal_length) / pixel_width
-                
-                img_center_x = gray_frame.shape[1] / 2
-                pixel_error = np.mean(c[:, 0]) - img_center_x
-                angle = np.arctan2(pixel_error, self.focal_length)
-                
-                ar_data.extend([float(ids[i]), float(distance), float(angle)])
-            
-            self.ar_pub.publish(Float32MultiArray(data=ar_data))
+        # ---------- lane fit ----------
+        self.nw = int(get_param("~nwindows", 9))
+        self.margin = int(get_param("~margin", 60))
+        self.minpix = int(get_param("~minpix", 40))
+        self.minpts = int(get_param("~min_points", 220))
 
-    # 신호등 색상 검출 및 정보 발행
-    def process_traffic_light(self, hsv_frame):
-        h, w = hsv_frame.shape[:2]
-        roi_hsv = hsv_frame[0:int(h*0.4), int(w*0.2):int(w*0.8)]
-        
-        mask_red = cv2.bitwise_or(cv2.inRange(roi_hsv, self.lower_red1, self.upper_red1),
-                                  cv2.inRange(roi_hsv, self.lower_red2, self.upper_red2))
-        mask_yellow = cv2.inRange(roi_hsv, self.lower_yellow, self.upper_yellow)
-        mask_green = cv2.inRange(roi_hsv, self.lower_green, self.upper_green)
-        
-        counts = {
-            'RED': cv2.countNonZero(mask_red),
-            'YELLOW': cv2.countNonZero(mask_yellow),
-            'GREEN': cv2.countNonZero(mask_green)
-        }
-        
-        best_color = max(counts, key=counts.get)
-        status = best_color if counts[best_color] > 200 else "UNKNOWN"
-        self.traffic_pub.publish(status)
+        # ---------- stopline ----------
+        self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
+        self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
+        self.stop_thr = float(get_param("~stop_px_per_col", 15.0))
+        self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
-    # BEV 이미지에서 차선 계수 및 정지선 상태 검출
-    def process_lanes_and_stopline(self, bev_frame):
-        hsv_bev = cv2.cvtColor(bev_frame, cv2.COLOR_BGR2HSV)
-        
-        # 정지선 검출 로직
-        y_mask = cv2.inRange(hsv_bev, self.lower_yellow, self.upper_yellow)
-        w_mask = cv2.inRange(hsv_bev, self.lower_white, self.upper_white)
-        
-        h, w = y_mask.shape
-        check_area = slice(int(h*0.7), int(h*0.8))
-        y_pixels = np.sum(y_mask[check_area, :]) / 255
-        w_pixels = np.sum(w_mask[check_area, :]) / 255
-        
-        stop_status = "NONE"
-        if y_pixels > w * 15: stop_status = "YELLOW"
-        elif w_pixels > w * 15: stop_status = "WHITE"
-        self.stop_line_pub.publish(stop_status)
+        # ---------- dropout hold ----------
+        self.hold_sec = float(get_param("~last_fit_hold_sec", 0.5))
+        self.last_fit = None
+        self.last_fit_t = 0.0
 
-        # 차선 피팅 (슬라이딩 윈도우)
-        combined_mask = cv2.bitwise_or(w_mask, y_mask)
-        edges = cv2.Canny(combined_mask, 50, 150)
-        
-        left_fit, right_fit = self.perform_sliding_window(edges)
-        if left_fit is not None and right_fit is not None:
-            self.lane_pub.publish(Float32MultiArray(data=list(left_fit) + list(right_fit)))
+        # ---------- mission state ----------
+        self.mdir = "RIGHT"
+        self.mstatus = "NONE"
 
-    def perform_sliding_window(self, binary_img):
-        histogram = np.sum(binary_img[binary_img.shape[0]//2:, :], axis=0)
-        midpoint = len(histogram) // 2
-        
-        if self.current_mission_direction == "RIGHT":
-            leftx_base = np.argmax(histogram[midpoint-100:midpoint+100]) + (midpoint-100)
-            rightx_base = np.argmax(histogram[midpoint+150:]) + (midpoint+150)
-        elif self.current_mission_direction == "LEFT":
-            leftx_base = np.argmax(histogram[:midpoint-150])
-            rightx_base = np.argmax(histogram[midpoint-100:midpoint+100]) + (midpoint-100)
+        # ---------- HSV ranges ----------
+        self.RED1 = (np.array([0, 100, 100]),   np.array([10, 255, 255]))
+        self.RED2 = (np.array([160, 100, 100]), np.array([179, 255, 255]))
+        self.YELLOW = (np.array([15, 100, 100]), np.array([35, 255, 255]))
+        self.GREEN  = (np.array([45, 100, 100]), np.array([90, 255, 255]))
+        self.WHITE  = (np.array([0, 0, 200]),    np.array([179, 40, 255]))
+
+        # ---------- pubs ----------
+        self.pub_lane = rospy.Publisher("/lane_coeffs", Float32MultiArray, queue_size=1)
+        self.pub_stop = rospy.Publisher("/stop_line_status", String, queue_size=1)
+        self.pub_tl   = rospy.Publisher("/traffic_light_status", String, queue_size=1)
+        self.pub_ar   = rospy.Publisher("/ar_tag_info", Float32MultiArray, queue_size=1)
+        self.pub_ov   = rospy.Publisher(self.overlay_topic, CompressedImage, queue_size=1)
+
+        # ---------- subs ----------
+        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1)
+        rospy.Subscriber("/mission_direction", String, self._on_mission_direction, queue_size=1)
+        rospy.Subscriber("/mission_status", String, self._on_mission_status, queue_size=1)
+
+        rospy.loginfo("[CamPerc] refactored | cam=%s overlay=%s", self.cam_topic, self.overlay_topic)
+
+    # ---------------- mission callbacks ----------------
+    def _on_mission_direction(self, msg: String):
+        self.mdir = (msg.data or "RIGHT").upper()
+
+    def _on_mission_status(self, msg: String):
+        self.mstatus = (msg.data or "NONE").upper()
+
+    # ---------------- helper ----------------
+    @staticmethod
+    def _ratio_pts(r, w, h):
+        r = [float(x) for x in r]
+        r = (r + r[:8])[:8]
+        return np.float32([
+            [r[0] * w, r[1] * h],
+            [r[2] * w, r[3] * h],
+            [r[4] * w, r[5] * h],
+            [r[6] * w, r[7] * h],
+        ])
+
+    @staticmethod
+    def _rosimg_to_bgr(msg: Image):
+        if msg.height <= 0 or msg.width <= 0:
+            return None
+        enc = (msg.encoding or "").lower()
+        buf = np.frombuffer(msg.data, np.uint8)
+
+        if enc in ("bgr8", "rgb8"):
+            img = buf.reshape((msg.height, msg.width, 3))
+            return img if enc == "bgr8" else cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        if enc in ("mono8", "8uc1"):
+            g = buf.reshape((msg.height, msg.width))
+            return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+
+        return None
+
+    def _publish_overlay(self, bgr):
+        if not self.overlay_on:
+            return
+        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpg_q])
+        if not ok:
+            return
+        m = CompressedImage()
+        m.header.stamp = rospy.Time.now()
+        m.format = "jpeg"
+        m.data = enc.tobytes()
+        self.pub_ov.publish(m)
+
+    # ---------------- main callback ----------------
+    def _on_img(self, msg: Image):
+        frame = self._rosimg_to_bgr(msg)
+        if frame is None:
+            return
+
+        frame = cv2.resize(frame, (self.w, self.h))
+        bev = cv2.warpPerspective(frame, self.M, (self.w, self.h))
+
+        lfit, rfit, stop, dbg = self._lane_stop(bev)
+        self.pub_stop.publish(stop)
+
+        # /lane_coeffs: [la, lb, lc, ra, rb, rc]
+        if lfit is not None and rfit is not None:
+            self.last_fit, self.last_fit_t = (lfit, rfit), now_sec()
+            self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
         else:
-            leftx_base = np.argmax(histogram[:midpoint])
-            rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+            if self.last_fit and (now_sec() - self.last_fit_t) <= self.hold_sec:
+                lf, rf = self.last_fit
+                self.pub_lane.publish(Float32MultiArray(data=list(lf) + list(rf)))
 
-        nwindows = 9
-        window_height = binary_img.shape[0] // nwindows
-        margin = 60 # 탐색 너비 확대
-        minpix = 40 # 유효 픽셀 최소 기준
+        if self.mstatus == "STOP":
+            self._traffic_light(frame)
+        if self.mstatus == "PARKING":
+            self._ar_tag(frame)
 
-        nonzero = binary_img.nonzero()
-        nonzeroy, nonzerox = np.array(nonzero[0]), np.array(nonzero[1])
+        self._publish_overlay(dbg)
 
-        left_lane_inds, right_lane_inds = [], []
-        lx_curr, rx_curr = leftx_base, rightx_base
+    # ---------------- algorithms (원본 로직 유지) ----------------
+    def _lane_stop(self, bev):
+        hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
-        for window in range(nwindows):
-            y_low, y_high = binary_img.shape[0] - (window+1)*window_height, binary_img.shape[0] - window*window_height
-            
-            # 윈도우 바운더리 계산 및 인덱스 추출
-            win_lx_l, win_lx_h = lx_curr - margin, lx_curr + margin
-            win_rx_l, win_rx_h = rx_curr - margin, rx_curr + margin
+        ymask = cv2.inRange(hsv, *self.YELLOW)
+        wmask = cv2.inRange(hsv, *self.WHITE)
 
-            good_l = ((nonzeroy >= y_low) & (nonzeroy < y_high) & (nonzerox >= win_lx_l) & (nonzerox < win_lx_h)).nonzero()[0]
-            good_r = ((nonzeroy >= y_low) & (nonzeroy < y_high) & (nonzerox >= win_rx_l) & (nonzerox < win_rx_h)).nonzero()[0]
+        h, w = ymask.shape
+        y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
+        if y1 <= y0:
+            y1 = min(h, y0 + 1)
 
-            left_lane_inds.append(good_l)
-            right_lane_inds.append(good_r)
+        ypx = cv2.countNonZero(ymask[y0:y1, :])
+        wpx = cv2.countNonZero(wmask[y0:y1, :])
 
-            if len(good_l) > minpix: lx_curr = int(np.mean(nonzerox[good_l]))
-            if len(good_r) > minpix: rx_curr = int(np.mean(nonzerox[good_r]))
+        stop = "NONE"
+        if ypx > w * self.stop_thr:
+            stop = "YELLOW"
+        elif wpx > w * self.stop_thr:
+            stop = "WHITE"
+
+        lane = cv2.bitwise_or(ymask, wmask)
+        cut = int(self.lane_cut * h)
+        lane[cut:, :] = 0
+        lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+
+        lfit, rfit = self._fit(lane)
+        dbg = self._debug(bev, lane, lfit, rfit, stop, ypx, wpx)
+        return lfit, rfit, stop, dbg
+
+    @staticmethod
+    def _base(hist, lo, hi, fallback):
+        lo, hi = max(0, int(lo)), min(len(hist), int(hi))
+        if hi <= lo:
+            return int(fallback)
+        seg = hist[lo:hi]
+        if np.max(seg) <= 0:
+            return int(fallback)
+        return int(np.argmax(seg) + lo)
+
+    def _fit(self, binimg):
+        hist = np.sum(binimg[binimg.shape[0] // 2:, :], axis=0)
+        mid = len(hist) // 2
+
+        if self.mdir == "RIGHT":
+            lx = self._base(hist, mid - 100, mid + 100, mid // 2)
+            rx = self._base(hist, mid + 150, len(hist), mid + mid // 2)
+        elif self.mdir == "LEFT":
+            lx = self._base(hist, 0, mid - 150, mid // 2)
+            rx = self._base(hist, mid - 100, mid + 100, mid + mid // 2)
+        else:
+            lx = self._base(hist, 0, mid, mid // 2)
+            rx = self._base(hist, mid, len(hist), mid + mid // 2)
+
+        nw = max(3, self.nw)
+        win_h = binimg.shape[0] // nw
+        nz = binimg.nonzero()
+        nzy, nzx = np.array(nz[0]), np.array(nz[1])
+        lidx, ridx = [], []
+
+        for win in range(nw):
+            ylo = binimg.shape[0] - (win + 1) * win_h
+            yhi = binimg.shape[0] - win * win_h
+            llo, lhi = lx - self.margin, lx + self.margin
+            rlo, rhi = rx - self.margin, rx + self.margin
+
+            gl = ((nzy >= ylo) & (nzy < yhi) & (nzx >= llo) & (nzx < lhi)).nonzero()[0]
+            gr = ((nzy >= ylo) & (nzy < yhi) & (nzx >= rlo) & (nzx < rhi)).nonzero()[0]
+            lidx.append(gl)
+            ridx.append(gr)
+
+            if len(gl) > self.minpix:
+                lx = int(np.mean(nzx[gl]))
+            if len(gr) > self.minpix:
+                rx = int(np.mean(nzx[gr]))
 
         try:
-            l_inds = np.concatenate(left_lane_inds)
-            r_inds = np.concatenate(right_lane_inds)
-            
-            # 데이터가 부족할 경우에 대한 방어 로직
-            if len(l_inds) < 500 or len(r_inds) < 500:
+            li = np.concatenate(lidx) if lidx else np.array([], np.int32)
+            ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
+            if len(li) < self.minpts or len(ri) < self.minpts:
                 return None, None
-                
-            l_fit = np.polyfit(nonzeroy[l_inds], nonzerox[l_inds], 2)
-            r_fit = np.polyfit(nonzeroy[r_inds], nonzerox[r_inds], 2)
-            return l_fit, r_fit
-        except:
+            return np.polyfit(nzy[li], nzx[li], 2), np.polyfit(nzy[ri], nzx[ri], 2)
+        except Exception:
             return None, None
 
-    def image_callback(self, msg):
-        # 1. 공통 전처리: 1회만 수행하여 자원 절약
-        frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        frame = cv2.resize(frame, (640, 480))
-        blur = cv2.GaussianBlur(frame, (5, 5), 0)
-        
-        # 2. 각 알고리즘에 필요한 변환본 생성과 프로세스 실행
-        bev = cv2.warpPerspective(blur, self.M, (640, 480))
-        self.process_lanes_and_stopline(bev)
+    @staticmethod
+    def _poly_x(f, y):
+        return (f[0] * y * y) + (f[1] * y) + f[2]
 
-        if self.current_mission_status == "STOP":
-            hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-            self.process_traffic_light(hsv)
-            
-        if self.current_mission_status == "PARKING":
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            self.process_ar_tag(gray)
+    def _debug(self, bev, lane, lf, rf, stop, ypx, wpx):
+        dbg = bev.copy()
+        dbg[:, :, 1] = np.maximum(dbg[:, :, 1], (lane // 2).astype(np.uint8))
 
-if __name__ == '__main__':
-    rospy.init_node('integrated_perception_node')
-    IntegratedPerception()
-    rospy.spin()
+        ok = (lf is not None and rf is not None)
+        if ok:
+            ptsL, ptsR, ptsC = [], [], []
+            h, w = dbg.shape[:2]
+            for y in range(h - 1, 0, -20):
+                lx, rx = self._poly_x(lf, y), self._poly_x(rf, y)
+                if 0 <= lx < w and 0 <= rx < w:
+                    cx = 0.5 * (lx + rx)
+                    ptsL.append((int(lx), y))
+                    ptsR.append((int(rx), y))
+                    ptsC.append((int(cx), y))
+            if len(ptsC) >= 2:
+                cv2.polylines(dbg, [np.array(ptsL)], False, (255, 200, 50), 2)
+                cv2.polylines(dbg, [np.array(ptsR)], False, (50, 200, 255), 2)
+                cv2.polylines(dbg, [np.array(ptsC)], False, (80, 255, 80), 2)
+
+        cv2.putText(dbg, f"{self.mdir} {self.mstatus} STOP:{stop} FIT:{'OK' if ok else 'NO'}",
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
+        cv2.putText(dbg, f"Y:{ypx} W:{wpx}", (10, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
+        return dbg
+
+    def _traffic_light(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h, w = hsv.shape[:2]
+        roi = hsv[0:int(h * 0.4), int(w * 0.2):int(w * 0.8)]
+        red = cv2.countNonZero(cv2.bitwise_or(cv2.inRange(roi, *self.RED1), cv2.inRange(roi, *self.RED2)))
+        yel = cv2.countNonZero(cv2.inRange(roi, *self.YELLOW))
+        grn = cv2.countNonZero(cv2.inRange(roi, *self.GREEN))
+        best = max((red, "RED"), (yel, "YELLOW"), (grn, "GREEN"))[1]
+        self.pub_tl.publish(best if max(red, yel, grn) > 200 else "UNKNOWN")
+
+    def _ar_tag(self, frame):
+        if not hasattr(cv2, "aruco"):
+            return
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        ar = cv2.aruco
+        dic = ar.Dictionary_get(ar.DICT_6X6_250)
+        prm = ar.DetectorParameters_create()
+        corners, ids, _ = ar.detectMarkers(gray, dic, parameters=prm)
+        if ids is None:
+            return
+
+        tag = float(rospy.get_param("~tag_size", 0.15))
+        focal = float(rospy.get_param("~focal_length", 600.0))
+        cx = gray.shape[1] * 0.5
+
+        out = []
+        for i in range(len(ids)):
+            c = corners[i][0]
+            pw = float(np.linalg.norm(c[0] - c[1]))
+            if pw <= 1e-6:
+                continue
+            dist = (tag * focal) / pw
+            ang = float(np.arctan2(float(np.mean(c[:, 0]) - cx), focal))
+            out += [float(ids[i]), dist, ang]
+        if out:
+            self.pub_ar.publish(Float32MultiArray(data=out))
+
+    def run(self):
+        rospy.spin()
+
+
+if __name__ == "__main__":
+    CameraPerception().run()

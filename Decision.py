@@ -214,6 +214,9 @@ class DecisionNode:
         rospy.init_node("decision_node")
 
         gp = lambda n, d: rospy.get_param("~" + n, d)
+        
+        self.prev_err = 0
+        self.total_err = 0
 
         # --- config ---
         self.cfg = type("Cfg", ()), {
@@ -221,7 +224,9 @@ class DecisionNode:
             "cen": int(gp("steer_center", 90)),
             "min": int(gp("steer_min", 45)),
             "max": int(gp("steer_max", 135)),
-            "k": float(gp("k_steer", 45.0)),
+            "kp": float(gp("kp_steer", 45.0)),
+            "ki": float(gp("ke_steer", 45.0)),
+            "kd": float(gp("kd_steer", 45.0)),
             "spd_drive": int(gp("speed_drive", 100)),
             "spd_stop": int(gp("speed_stop", 90)),
             "spd_parking": int(gp("speed_parking", 99)),
@@ -374,7 +379,12 @@ class DecisionNode:
             y = (self.cfg.h - 1) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w) * 0.5)
             err_norm = (half_w - s.lane.x_center(y)) / half_w
-            steer = self.cfg.cen + int(err_norm * float(self.cfg.k))
+            p_term = err_norm * float(self.cfg.kp)
+            self.total_err += err_norm
+            i_term = self.total_err * float(self.cfg.ki)
+            d_term = (err_norm - self.prev_err) * float(self.cfg.kd)
+            steer = self.cfg.cen + p_term + i_term + d_term
+            self.prev_err = err_norm
             steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 
         # 2) PF blend (optional)

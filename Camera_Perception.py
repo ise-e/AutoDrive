@@ -39,9 +39,9 @@ class CameraPerception:
             "overlay_enable": True, "jpeg_quality": 80,
             "src_pts_ratio": [200/640, 300/480, 440/640, 300/480, 50/640, 450/480, 590/640, 450/480],
             "dst_pts_ratio": [150/640, 0.0, 490/640, 0.0, 150/640, 1.0, 490/640, 1.0],
-            "nwindows": 9, "margin": 60, "minpix": 50, "min_points": 220,
-            "stop_check_y0": 0.70, "stop_check_y1": 0.80, "stop_px_per_col": 15.0, "lane_fit_ymax": 0.70,
-            "last_fit_hold_sec": 0.5,
+            "nwindows": 9, "margin": 60, "minpix": 50, "min_points": 150,
+            "stop_check_y0": 0.70, "stop_check_y1": 0.80, "stop_px_per_col": 15.0, "lane_fit_ymax": 1.0,
+            "last_fit_hold_sec": 1.5,
             "tag_size": 0.15, "focal_length": 600.0,
         }
         for k, v in d.items():

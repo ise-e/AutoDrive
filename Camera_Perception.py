@@ -108,79 +108,79 @@ class CameraPerception:
         if len(li) < int(self.min_points) or len(ri) < int(self.min_points):
             return None, None
         return np.polyfit(nzy[li], nzx[li], 2), np.polyfit(nzy[ri], nzx[ri], 2)
-def _debug(self, frame, bev, lane, lfit, rfit, stop, stop_roi):
-    # frame: 원본 시점(카메라) 영상(리사이즈된 out_w/out_h)
-    # bev  : 차선 검출에 사용한 BEV 영상(디버그용이 아니라 변환 좌표계용)
-    # lane : BEV에서 만든 바이너리 마스크
-    dbg = frame.copy()
-    h, w = lane.shape[:2]
+    def _debug(self, frame, bev, lane, lfit, rfit, stop, stop_roi):
+        # frame: 원본 시점(카메라) 영상(리사이즈된 out_w/out_h)
+        # bev  : 차선 검출에 사용한 BEV 영상(디버그용이 아니라 변환 좌표계용)
+        # lane : BEV에서 만든 바이너리 마스크
+        dbg = frame.copy()
+        h, w = lane.shape[:2]
 
-    # ----- 1) 차선(중앙선/좌/우) 시각화: BEV 좌표 -> 카메라 좌표로 역투영 -----
-    if lfit is not None and rfit is not None:
-        ys = np.linspace(0, h - 1, 25, dtype=np.float32)
-        xl = np.polyval(lfit, ys).astype(np.float32)
-        xr = np.polyval(rfit, ys).astype(np.float32)
-        cx = (xl + xr) * 0.5
+        # ----- 1) 차선(중앙선/좌/우) 시각화: BEV 좌표 -> 카메라 좌표로 역투영 -----
+        if lfit is not None and rfit is not None:
+            ys = np.linspace(0, h - 1, 25, dtype=np.float32)
+            xl = np.polyval(lfit, ys).astype(np.float32)
+            xr = np.polyval(rfit, ys).astype(np.float32)
+            cx = (xl + xr) * 0.5
 
-        pts_c_bev = np.stack([cx, ys], axis=1).reshape(-1, 1, 2).astype(np.float32)
-        pts_l_bev = np.stack([xl, ys], axis=1).reshape(-1, 1, 2).astype(np.float32)
-        pts_r_bev = np.stack([xr, ys], axis=1).reshape(-1, 1, 2).astype(np.float32)
+            pts_c_bev = np.stack([cx, ys], axis=1).reshape(-1, 1, 2).astype(np.float32)
+            pts_l_bev = np.stack([xl, ys], axis=1).reshape(-1, 1, 2).astype(np.float32)
+            pts_r_bev = np.stack([xr, ys], axis=1).reshape(-1, 1, 2).astype(np.float32)
 
-        pts_c = cv2.perspectiveTransform(pts_c_bev, self.Minv).astype(np.int32)
-        pts_l = cv2.perspectiveTransform(pts_l_bev, self.Minv).astype(np.int32)
-        pts_r = cv2.perspectiveTransform(pts_r_bev, self.Minv).astype(np.int32)
+            pts_c = cv2.perspectiveTransform(pts_c_bev, self.Minv).astype(np.int32)
+            pts_l = cv2.perspectiveTransform(pts_l_bev, self.Minv).astype(np.int32)
+            pts_r = cv2.perspectiveTransform(pts_r_bev, self.Minv).astype(np.int32)
 
-        cv2.polylines(dbg, [pts_l], False, (255, 0, 0), 2)   # left
-        cv2.polylines(dbg, [pts_r], False, (0, 0, 255), 2)   # right
-        cv2.polylines(dbg, [pts_c], False, (0, 255, 0), 2)   # center
+            cv2.polylines(dbg, [pts_l], False, (255, 0, 0), 2)   # left
+            cv2.polylines(dbg, [pts_r], False, (0, 0, 255), 2)   # right
+            cv2.polylines(dbg, [pts_c], False, (0, 255, 0), 2)   # center
 
-    # ----- 2) 정지선 체크 ROI 시각화 (BEV ROI를 카메라로 역투영해서 폴리곤 표시) -----
-    y0, y1 = stop_roi
-    roi_bev = np.array([
-        [[0, y0]],
-        [[w - 1, y0]],
-        [[w - 1, y1]],
-        [[0, y1]],
-    ], dtype=np.float32)
-    roi_img = cv2.perspectiveTransform(roi_bev, self.Minv).astype(np.int32)
+        # ----- 2) 정지선 체크 ROI 시각화 (BEV ROI를 카메라로 역투영해서 폴리곤 표시) -----
+        y0, y1 = stop_roi
+        roi_bev = np.array([
+            [[0, y0]],
+            [[w - 1, y0]],
+            [[w - 1, y1]],
+            [[0, y1]],
+        ], dtype=np.float32)
+        roi_img = cv2.perspectiveTransform(roi_bev, self.Minv).astype(np.int32)
 
-    # stop 상태에 따라 색만 다르게 표시
-    roi_color = (0, 0, 255) if stop != "NONE" else (0, 255, 255)
-    cv2.polylines(dbg, [roi_img], True, roi_color, 2)
+        # stop 상태에 따라 색만 다르게 표시
+        roi_color = (0, 0, 255) if stop != "NONE" else (0, 255, 255)
+        cv2.polylines(dbg, [roi_img], True, roi_color, 2)
 
-    # ----- 3) 텍스트 오버레이 -----
-    cv2.putText(
-        dbg,
-        f"STOP={stop}  mdir={self.mdir}  st={self.mstatus}",
-        (10, 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 0),
-        2,
-    )
-    return dbg
-def _lane_stop(self, frame, bev):
-    hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
-    ymask = cv2.inRange(hsv, *self.YELLOW)
-    wmask = cv2.inRange(hsv, *self.WHITE)
+        # ----- 3) 텍스트 오버레이 -----
+        cv2.putText(
+            dbg,
+            f"STOP={stop}  mdir={self.mdir}  st={self.mstatus}",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+        return dbg
+    def _lane_stop(self, frame, bev):
+        hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
+        ymask = cv2.inRange(hsv, *self.YELLOW)
+        wmask = cv2.inRange(hsv, *self.WHITE)
 
-    h, w = ymask.shape
-    y0 = int(float(self.stop_check_y0) * h)
-    y1 = int(float(self.stop_check_y1) * h)
-    y1 = min(h, max(y0 + 1, y1))
+        h, w = ymask.shape
+        y0 = int(float(self.stop_check_y0) * h)
+        y1 = int(float(self.stop_check_y1) * h)
+        y1 = min(h, max(y0 + 1, y1))
 
-    ypx = cv2.countNonZero(ymask[y0:y1, :])
-    wpx = cv2.countNonZero(wmask[y0:y1, :])
+        ypx = cv2.countNonZero(ymask[y0:y1, :])
+        wpx = cv2.countNonZero(wmask[y0:y1, :])
 
-    stop = "YELLOW" if ypx > w * float(self.stop_px_per_col) else ("WHITE" if wpx > w * float(self.stop_px_per_col) else "NONE")
+        stop = "YELLOW" if ypx > w * float(self.stop_px_per_col) else ("WHITE" if wpx > w * float(self.stop_px_per_col) else "NONE")
 
-    lane = cv2.bitwise_or(ymask, wmask)
-    lane[int(float(self.lane_fit_ymax) * h):, :] = 0
-    lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+        lane = cv2.bitwise_or(ymask, wmask)
+        lane[int(float(self.lane_fit_ymax) * h):, :] = 0
+        lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
 
-    lfit, rfit = self._fit(lane)
-    dbg = self._debug(frame, bev, lane, lfit, rfit, stop, (y0, y1))
-    return lfit, rfit, stop, dbg
+        lfit, rfit = self._fit(lane)
+        dbg = self._debug(frame, bev, lane, lfit, rfit, stop, (y0, y1))
+        return lfit, rfit, stop, dbg
     def _traffic_light(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h, w = hsv.shape[:2]

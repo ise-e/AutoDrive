@@ -69,6 +69,10 @@ class CameraPerception:
         self.margin = int(get_param("~margin", 60))
         self.minpix = int(get_param("~minpix", 40))
         self.minpts = int(get_param("~min_points", 220))
+        self.init_margin = int(get_param("~init_margin", self.margin * 2))     # 초기 획득용 더 넓은 밴드
+        self.lane_conf_min = float(get_param("~lane_conf_min", 0.6))           # conf 미만이면 last_fit 유지
+        self.adapt_white = bool(get_param("~adapt_white", True))               # 조명 적응형 WHITE 마스크
+        self.white_v_min = int(get_param("~white_v_min", 170))                 # WHITE V 하한 최소값
 
         # ---------- stopline ----------
         self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
@@ -187,8 +191,15 @@ class CameraPerception:
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
         ymask = cv2.inRange(hsv, *self.YELLOW)
-        wmask = cv2.inRange(hsv, *self.WHITE)
 
+        if self.adapt_white:
+            v = hsv[:, :, 2]
+            v_lo = max(self.white_v_min, int(np.percentile(v, 70)))
+            w_low = np.array([0, 0, v_lo], dtype=np.uint8)
+            wmask = cv2.inRange(hsv, w_low, self.WHITE[1])
+        else:
+            wmask = cv2.inRange(hsv, *self.WHITE)
+        
         h, w = ymask.shape
         y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
         if y1 <= y0:
@@ -223,49 +234,57 @@ class CameraPerception:
         return int(np.argmax(seg) + lo)
 
     def _fit(self, binimg):
-        hist = np.sum(binimg[binimg.shape[0] // 2:, :], axis=0)
+        h, w = binimg.shape[:2]
+        hist = np.sum(binimg[h // 2:, :], axis=0)
         mid = len(hist) // 2
 
         if self.mdir == "RIGHT":
-            lx = self._base(hist, mid - 100, mid + 100, mid // 2)
-            rx = self._base(hist, mid + 150, len(hist), mid + mid // 2)
+            lx0 = self._base(hist, mid - 100, mid + 100, mid // 2)
+            rx0 = self._base(hist, mid + 150, len(hist), mid + mid // 2)
         elif self.mdir == "LEFT":
-            lx = self._base(hist, 0, mid - 150, mid // 2)
-            rx = self._base(hist, mid - 100, mid + 100, mid + mid // 2)
+            lx0 = self._base(hist, 0, mid - 150, mid // 2)
+            rx0 = self._base(hist, mid - 100, mid + 100, mid + mid // 2)
         else:
-            lx = self._base(hist, 0, mid, mid // 2)
-            rx = self._base(hist, mid, len(hist), mid + mid // 2)
+            lx0 = self._base(hist, 0, mid, mid // 2)
+            rx0 = self._base(hist, mid, len(hist), mid + mid // 2)
 
-        nw = max(3, self.nw)
-        win_h = binimg.shape[0] // nw
         nz = binimg.nonzero()
         nzy, nzx = np.array(nz[0]), np.array(nz[1])
-        lidx, ridx = [], []
-
-        for win in range(nw):
-            ylo = binimg.shape[0] - (win + 1) * win_h
-            yhi = binimg.shape[0] - win * win_h
-            llo, lhi = lx - self.margin, lx + self.margin
-            rlo, rhi = rx - self.margin, rx + self.margin
-
-            gl = ((nzy >= ylo) & (nzy < yhi) & (nzx >= llo) & (nzx < lhi)).nonzero()[0]
-            gr = ((nzy >= ylo) & (nzy < yhi) & (nzx >= rlo) & (nzx < rhi)).nonzero()[0]
-            lidx.append(gl)
-            ridx.append(gr)
-
-            if len(gl) > self.minpix:
-                lx = int(np.mean(nzx[gl]))
-            if len(gr) > self.minpix:
-                rx = int(np.mean(nzx[gr]))
-
-        try:
-            li = np.concatenate(lidx) if lidx else np.array([], np.int32)
-            ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
-            if len(li) < self.minpts or len(ri) < self.minpts:
-                return None, None
-            return np.polyfit(nzy[li], nzx[li], 2), np.polyfit(nzy[ri], nzx[ri], 2)
-        except Exception:
+        if nzy.size < (self.minpts * 2):
             return None, None
+
+        def sane(lf, rf):
+            y = int(h * 0.60)
+            lw = float(self._poly_x(rf, y) - self._poly_x(lf, y))
+            return (0.25 * w) <= lw <= (0.95 * w)
+
+        def around_fit(lf, rf):
+            li = np.abs(nzx - self._poly_x(lf, nzy)) < self.margin
+            ri = np.abs(nzx - self._poly_x(rf, nzy)) < self.margin
+            lcnt, rcnt = int(li.sum()), int(ri.sum())
+            conf = min(lcnt, rcnt) / float(self.minpts)
+            if lcnt < self.minpts or rcnt < self.minpts or conf < self.lane_conf_min:
+                return None, None
+            lfit = np.polyfit(nzy[li], nzx[li], 2)
+            rfit = np.polyfit(nzy[ri], nzx[ri], 2)
+            return (lfit, rfit) if sane(lfit, rfit) else (None, None)
+
+        # 1) 이전 프레임 기반 around-poly (A)
+        if self.last_fit and (now_sec() - self.last_fit_t) <= self.hold_sec:
+            lf, rf = self.last_fit
+            lfit, rfit = around_fit(lf, rf)
+            if lfit is not None:
+                return lfit, rfit
+
+        # 2) 초기 획득: 베이스 x 주변 넓은 밴드 -> 1회 정제 (짧게)
+        li0 = np.abs(nzx - lx0) < self.init_margin
+        ri0 = np.abs(nzx - rx0) < self.init_margin
+        if int(li0.sum()) < self.minpts or int(ri0.sum()) < self.minpts:
+            return None, None
+
+        lf0 = np.polyfit(nzy[li0], nzx[li0], 2)
+        rf0 = np.polyfit(nzy[ri0], nzx[ri0], 2)
+        return around_fit(lf0, rf0)
 
     @staticmethod
     def _poly_x(f, y):

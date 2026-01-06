@@ -3,9 +3,8 @@
 
 """
 DecisionNode
-- 개선된 I/O / PF 블렌드 / Lane RViz marker 구조는 유지
-- 상태머신만 "기존 대회 시나리오 FSM"으로 사용
-- ✅ FSM 로그 추가:
+- 개선된 I/O / PF 블렌드 
+- FSM 로그 추가:
   1) 상태 전이 로그: 전이 발생 시 1회 출력
   2) 상태 유지 로그: 1Hz throttle로 현재 입력/출력/명령 출력
 """
@@ -217,7 +216,7 @@ class DecisionNode:
         gp = lambda n, d: rospy.get_param("~" + n, d)
 
         # --- config ---
-        self.cfg = type("Cfg", (), {
+        self.cfg = type("Cfg", ()), {
             # steering / speed
             "cen": int(gp("steer_center", 90)),
             "min": int(gp("steer_min", 45)),
@@ -251,17 +250,7 @@ class DecisionNode:
             # parking search (AR 없을 때)
             "park_search_sec": float(gp("park_search_sec", 1.0)),
             "park_search_speed": int(gp("park_search_speed", 98)),
-
-            # viz
-            "base_frame": str(gp("base_frame", "base_link")),
-            "meters_per_pixel_x": float(gp("meters_per_pixel_x", 0.01)),
-            "meters_per_pixel_y": float(gp("meters_per_pixel_y", 0.01)),
-            "lane_marker_enable": bool(gp("lane_marker_enable", True)),
-            "lane_marker_topic": str(gp("lane_marker_topic", "/viz/lanes")),
-            "lane_marker_width": float(gp("lane_marker_width", 0.02)),
-            "lane_marker_lifetime": float(gp("lane_marker_lifetime", 0.2)),
-            "lane_sample_step_px": int(gp("lane_sample_step_px", 40)),
-        })()
+        }
 
         # --- FSM ---
         self.fsm = LegacyScenarioFSM(
@@ -284,10 +273,6 @@ class DecisionNode:
         self.pub_motor = rospy.Publisher("/motor", Int16MultiArray, queue_size=1)
         self.pub_dir = rospy.Publisher("/mission_direction", String, queue_size=1)
         self.pub_status = rospy.Publisher("/mission_status", String, queue_size=1)
-
-        self.pub_viz = None
-        if self.cfg.lane_marker_enable and self.cfg.lane_marker_topic:
-            self.pub_viz = rospy.Publisher(self.cfg.lane_marker_topic, MarkerArray, queue_size=1)
 
         # --- subscribers ---
         rospy.Subscriber("/lane_coeffs", Float32MultiArray, self._cb_lane, queue_size=1)
@@ -441,57 +426,6 @@ class DecisionNode:
         # FINISH는 외부에서 STOP처럼 다루는 경우가 많아 STOP으로 내보냄
         self.pub_status.publish("STOP" if f.mission_status == "FINISH" else f.mission_status)
 
-        # viz
-        if self.pub_viz and s.lane:
-            try:
-                self._viz_lane(s.lane)
-            except Exception as e:
-                rospy.logwarn_throttle(1.0, f"[Decision] lane marker publish failed: {e}")
-
-    # ---------------- Viz ----------------
-    def _px_to_base(self, x_px: float, y_px: float) -> Tuple[float, float]:
-        cx = float(self.cfg.w) * 0.5
-        forward_m = (float(self.cfg.h) - float(y_px)) * float(self.cfg.meters_per_pixel_y)
-        left_m = -(float(x_px) - cx) * float(self.cfg.meters_per_pixel_x)
-        return float(forward_m), float(left_m)
-
-    def _line_marker(self, ns: str, mid: int, pts_xy, rgb) -> Marker:
-        m = Marker()
-        m.header.stamp = rospy.Time.now()
-        m.header.frame_id = self.cfg.base_frame
-        m.ns, m.id = ns, int(mid)
-        m.type, m.action = Marker.LINE_STRIP, Marker.ADD
-        m.pose.orientation.w = 1.0
-        m.scale.x = float(self.cfg.lane_marker_width)
-        m.color.r, m.color.g, m.color.b, m.color.a = float(rgb[0]), float(rgb[1]), float(rgb[2]), 0.9
-        m.lifetime = rospy.Duration(float(self.cfg.lane_marker_lifetime))
-        for x, y in pts_xy:
-            m.points.append(Point(x=float(x), y=float(y), z=0.05))
-        return m
-
-    def _viz_lane(self, lane: Lane) -> None:
-        step = max(1, int(self.cfg.lane_sample_step_px))
-        left_pts, right_pts, center_pts = [], [], []
-
-        for y in range(int(self.cfg.h) - 1, -1, -step):
-            y_f = float(y)
-            lx = lane.x_poly(y_f, True)
-            rx = lane.x_poly(y_f, False)
-            cx = 0.5 * (lx + rx)
-            left_pts.append(self._px_to_base(lx, y_f))
-            right_pts.append(self._px_to_base(rx, y_f))
-            center_pts.append(self._px_to_base(cx, y_f))
-
-        if len(center_pts) < 2:
-            return
-
-        ma = MarkerArray()
-        ma.markers = [
-            self._line_marker("lane_left", 0, left_pts, (0.2, 0.6, 1.0)),
-            self._line_marker("lane_right", 1, right_pts, (1.0, 0.6, 0.2)),
-            self._line_marker("lane_center", 2, center_pts, (0.3, 1.0, 0.3)),
-        ]
-        self.pub_viz.publish(ma)
 
     # ---------------- utils ----------------
     @staticmethod

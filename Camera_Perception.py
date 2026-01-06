@@ -287,8 +287,8 @@ class CameraPerception:
                     ptsR.append((int(rx), y))
                     ptsC.append((int(cx), y))
             if len(ptsC) >= 2:
-                cv2.polylines(dbg, [np.array(ptsL)], False, (255, 200, 50), 2)
-                cv2.polylines(dbg, [np.array(ptsR)], False, (50, 200, 255), 2)
+                cv2.polylines(dbg, [np.array(ptsL)], False, (255, 0, 0), 2)
+                cv2.polylines(dbg, [np.array(ptsR)], False, (0, 0, 255), 2)
                 cv2.polylines(dbg, [np.array(ptsC)], False, (80, 255, 80), 2)
 
         cv2.putText(dbg, f"{self.mdir} {self.mstatus} STOP:{stop} FIT:{'OK' if ok else 'NO'}",

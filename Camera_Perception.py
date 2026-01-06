@@ -165,9 +165,10 @@ class CameraPerception:
             return
 
         frame = cv2.resize(frame, (self.w, self.h))
+        debug_frame = frame.copy()
         bev = cv2.warpPerspective(frame, self.M, (self.w, self.h))
 
-        lfit, rfit, stop, dbg = self._lane_stop(bev)
+        lfit, rfit, stop, debug_bev = self._lane_stop(bev)
         self.pub_stop.publish(stop)
 
         # /lane_coeffs: [la, lb, lc, ra, rb, rc]
@@ -180,11 +181,15 @@ class CameraPerception:
                 self.pub_lane.publish(Float32MultiArray(data=list(lf) + list(rf)))
 
         if self.mstatus == "STOP":
-            self._traffic_light(frame)
+            # 신호등 탐지 함수 -> None 또는 업데이트 된 debug_frame 반환
+            debug_frame = self._traffic_light(frame, debug_frame) or debug_frame
         if self.mstatus == "PARKING":
-            self._ar_tag(frame)
+            # AR Tag 탐지 함수 -> None 또는 업데이트 된 debug_frame 반환
+            debug_frame = self._ar_tag(frame, debug_frame) or debug_frame
 
-        self._publish_overlay(dbg)
+        # debug 화면 두개 세로로 붙이기
+        combined_view = np.hstack([debug_frame, debug_bev])
+        self._publish_overlay(combined_view)
 
     # ---------------- algorithms (원본 로직 유지) ----------------
     def _lane_stop(self, bev):
@@ -219,8 +224,8 @@ class CameraPerception:
         lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
 
         lfit, rfit = self._fit(lane)
-        dbg = self._debug(bev, lane, lfit, rfit, stop, ypx, wpx)
-        return lfit, rfit, stop, dbg
+        debug_bev = self._debug_line(bev, lane, lfit, rfit, stop, ypx, wpx, stop)
+        return lfit, rfit, stop, debug_bev
 
     @staticmethod
     def _base(hist, lo, hi, fallback):
@@ -289,14 +294,28 @@ class CameraPerception:
     def _poly_x(f, y):
         return (f[0] * y * y) + (f[1] * y) + f[2]
 
-    def _debug(self, bev, lane, lf, rf, stop, ypx, wpx):
-        dbg = bev.copy()
-        dbg[:, :, 1] = np.maximum(dbg[:, :, 1], (lane // 2).astype(np.uint8))
+    def _debug_line(self, bev, lane, lf, rf, stop, ypx, wpx, color):
+        debug_bev = bev.copy()
+        debug_bev[:, :, 1] = np.maximum(debug_bev[:, :, 1], (lane // 2).astype(np.uint8))
+
+        # ===== [DEBUG] 시각화 코드 ========
+        if color != "NONE":
+            h, w = debug_bev.shape[:2]
+            y0 = int(self.stop_y0 * h)
+            y1 = int(self.stop_y1 * h)
+
+            box_color = (0, 255, 255) if stop == "YELLOW" else (200, 200, 200)
+
+            cv2.rectangle(debug_bev, (0, y0), (w, y1), box_color, 4)
+
+            cv2.putText(debug_bev, f"{stop} LINE", (w//2 - 100, y0 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, box_color, 2)
+        # ================================
 
         ok = (lf is not None and rf is not None)
         if ok:
             ptsL, ptsR, ptsC = [], [], []
-            h, w = dbg.shape[:2]
+            h, w = debug_bev.shape[:2]
             for y in range(h - 1, 0, -20):
                 lx, rx = self._poly_x(lf, y), self._poly_x(rf, y)
                 if 0 <= lx < w and 0 <= rx < w:
@@ -305,17 +324,28 @@ class CameraPerception:
                     ptsR.append((int(rx), y))
                     ptsC.append((int(cx), y))
             if len(ptsC) >= 2:
-                cv2.polylines(dbg, [np.array(ptsL)], False, (255, 0, 0), 2)
-                cv2.polylines(dbg, [np.array(ptsR)], False, (0, 0, 255), 2)
-                cv2.polylines(dbg, [np.array(ptsC)], False, (80, 255, 80), 2)
+                cv2.polylines(debug_bev, [np.array(ptsL)], False, (255, 0, 0), 2)
+                cv2.polylines(debug_bev, [np.array(ptsR)], False, (0, 0, 255), 2)
+                cv2.polylines(debug_bev, [np.array(ptsC)], False, (80, 255, 80), 2)
 
-        cv2.putText(dbg, f"{self.mdir} {self.mstatus} STOP:{stop} FIT:{'OK' if ok else 'NO'}",
+        cv2.putText(debug_bev, f"{self.mdir} {self.mstatus} STOP:{stop} FIT:{'OK' if ok else 'NO'}",
                     (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
-        cv2.putText(dbg, f"Y:{ypx} W:{wpx}", (10, 42),
+        cv2.putText(debug_bev, f"Y:{ypx} W:{wpx}", (10, 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
-        return dbg
+        return debug_bev
 
-    def _traffic_light(self, frame):
+    # 신호등 탐지 시각화 함수
+    def _debug_light(self, debug_frame, min_h, max_h, min_w, max_w, light):
+        color = (0, 0, 0)
+        if light == "GREEN":
+            color = (0, 255, 0)
+        elif light == "YELLOW":
+            color = (0, 255, 255)
+        else:
+            color = (0, 0, 255)
+        cv2.rectangle(debug_frame, (min_w, min_h), (max_w, max_h) , color, thickness=3)
+
+    def _traffic_light(self, frame, debug_frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h, w = hsv.shape[:2]
         roi = hsv[0:int(h * 0.4), int(w * 0.2):int(w * 0.8)]
@@ -323,9 +353,15 @@ class CameraPerception:
         yel = cv2.countNonZero(cv2.inRange(roi, *self.YELLOW))
         grn = cv2.countNonZero(cv2.inRange(roi, *self.GREEN))
         best = max((red, "RED"), (yel, "YELLOW"), (grn, "GREEN"))[1]
-        self.pub_tl.publish(best if max(red, yel, grn) > 200 else "UNKNOWN")
+        light_result = best if max(red, yel, grn) > 200 else "UNKNOWN"
+        self.pub_tl.publish(light_result)
 
-    def _ar_tag(self, frame):
+        # ==============DEBUG==============
+        if light_result != "UNKNOWN":
+            self._debug_light(debug_frame, 0, int(h * 0.4), int(w * 0.2), int(w * 0.8), light_result)
+        return debug_frame
+
+    def _ar_tag(self, frame, debug_frame):
         if not hasattr(cv2, "aruco"):
             return
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -335,6 +371,8 @@ class CameraPerception:
         corners, ids, _ = ar.detectMarkers(gray, dic, parameters=prm)
         if ids is None:
             return
+
+        cv2.aruco.drawDetectedMarkers(debug_frame, corners, ids, (255, 0, 0)) # 시각화 코드
 
         tag = float(rospy.get_param("~tag_size", 0.15))
         focal = float(rospy.get_param("~focal_length", 600.0))
@@ -351,6 +389,7 @@ class CameraPerception:
             out += [float(ids[i]), dist, ang]
         if out:
             self.pub_ar.publish(Float32MultiArray(data=out))
+        return debug_frame
 
     def run(self):
         rospy.spin()

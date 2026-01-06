@@ -221,7 +221,7 @@ class DecisionNode:
             "min": int(gp("steer_min", 45)),
             "max": int(gp("steer_max", 135)),
             "stanley_k": float(gp("stanley_k", 2.5)),
-+           "stanley_v_eps": float(gp("stanley_v_eps", 50.0)),  # 속도 0 근처에서 발산 방지
+            "stanley_v_eps": float(gp("stanley_v_eps", 50.0)),  # 속도 0 근처에서 발산 방지
             "spd_drive": int(gp("speed_drive", 100)),
             "spd_stop": int(gp("speed_stop", 90)),
             "spd_parking": int(gp("speed_parking", 99)),

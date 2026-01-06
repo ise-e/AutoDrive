@@ -18,8 +18,6 @@ from typing import Optional, Tuple, Dict, Any, List
 
 import rospy
 from std_msgs.msg import Int16MultiArray, String, Float32MultiArray, Float32
-from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
 
 
 # ---------------- Data Structures ----------------
@@ -215,18 +213,15 @@ class DecisionNode:
 
         gp = lambda n, d: rospy.get_param("~" + n, d)
         
-        self.prev_err = 0
-        self.total_err = 0
 
         # --- config ---
-        self.cfg = type("Cfg", ()), {
+        self.cfg = type("Cfg", (), {
             # steering / speed
             "cen": int(gp("steer_center", 90)),
             "min": int(gp("steer_min", 45)),
             "max": int(gp("steer_max", 135)),
-            "kp": float(gp("kp_steer", 45.0)),
-            "ki": float(gp("ke_steer", 45.0)),
-            "kd": float(gp("kd_steer", 45.0)),
+            "stanley_k": float(gp("stanley_k", 2.5)),
++           "stanley_v_eps": float(gp("stanley_v_eps", 50.0)),  # 속도 0 근처에서 발산 방지
             "spd_drive": int(gp("speed_drive", 100)),
             "spd_stop": int(gp("speed_stop", 90)),
             "spd_parking": int(gp("speed_parking", 99)),
@@ -255,7 +250,7 @@ class DecisionNode:
             # parking search (AR 없을 때)
             "park_search_sec": float(gp("park_search_sec", 1.0)),
             "park_search_speed": int(gp("park_search_speed", 98)),
-        }
+        })()
 
         # --- FSM ---
         self.fsm = LegacyScenarioFSM(
@@ -301,20 +296,31 @@ class DecisionNode:
                 self._d[tkey] = now
 
     def _cb_lane(self, m: Float32MultiArray) -> None:
-        lane = Lane(list(m.data)) if (m.data and len(m.data) >= 6) else None
-        y_eval = 480
-        if m.data is None:
-            lane = None
-        elif (m.data and len(m.data) >= 6):
-            lane = Lane(list(m.data))
-        else:
-            a, b, c = lane.c
-            LINE_WIDTH = 500
-            if a*y_eval**2 + b*y_eval + c > 320:
-                lane = Lane([0, 0, c-LINE_WIDTH]+list(m.data))
-            else:
-                lane = Lane(list(m.data)+[0, 0, c+LINE_WIDTH])
-        self._up("lane", lane)
+        data = list(m.data) if (m.data and len(m.data) >= 6) else None
+        self._up("lane", Lane(data) if data else None)
+
+    def _stanley_steer(self, lane: Lane, speed: int) -> int:
+        # y는 기존 lane_eval_y 그대로 재사용 (파라미터 추가 안 함)
+        y = (self.cfg.h - 1) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+        half_w = max(1.0, float(self.cfg.w) * 0.5)
+
+        # 1) Cross-track error (정규화). +면 "왼쪽으로 가야" 중앙
+        cte = (half_w - lane.x_center(y)) / half_w
+
+        # 2) Heading error: 중앙선 기울기(dx/dy)로 진행 방향 오차(도)
+        la, lb, _, ra, rb, _ = lane.c
+        a = 0.5 * (la + ra)
+        b = 0.5 * (lb + rb)
+        dxdy = 2.0 * a * y + b
+        heading_deg = -math.degrees(math.atan(dxdy))
+
+        # 3) Stanley 보정항 (속도 클수록 cte 영향 감소)
+        v = max(float(self.cfg.stanley_v_eps), float(speed))
+        cte_deg = math.degrees(math.atan2(float(self.cfg.stanley_k) * cte, v))
+
+        # deg -> steer 단위 변환은 기존 pf_gain_deg_to_steer 재사용(코드/파라미터 절약)
+        steer = int(float(self.cfg.cen) + (heading_deg + cte_deg) * float(self.cfg.pf_gain_deg_to_steer))
+        return self._clamp_i(steer, self.cfg.min, self.cfg.max)      
 
     def _cb_ar(self, m: Float32MultiArray) -> None:
         # format: [id, dist, ang(rad)]
@@ -376,16 +382,7 @@ class DecisionNode:
 
         # 1) Lane -> steer
         if s.lane:
-            y = (self.cfg.h - 1) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
-            half_w = max(1.0, float(self.cfg.w) * 0.5)
-            err_norm = (half_w - s.lane.x_center(y)) / half_w
-            p_term = err_norm * float(self.cfg.kp)
-            self.total_err += err_norm
-            i_term = self.total_err * float(self.cfg.ki)
-            d_term = (err_norm - self.prev_err) * float(self.cfg.kd)
-            steer = self.cfg.cen + p_term + i_term + d_term
-            self.prev_err = err_norm
-            steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+            steer = self._stanley_steer(s.lane, speed)
 
         # 2) PF blend (optional)
         if self.cfg.pf_enable and (s.pf_dir is not None):

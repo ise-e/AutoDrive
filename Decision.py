@@ -312,6 +312,18 @@ class DecisionNode:
 
     def _cb_lane(self, m: Float32MultiArray) -> None:
         lane = Lane(list(m.data)) if (m.data and len(m.data) >= 6) else None
+        y_eval = 480
+        if m.data is None:
+            lane = None
+        elif (m.data and len(m.data) >= 6):
+            lane = Lane(list(m.data))
+        else:
+            a, b, c = lane.c
+            LINE_WIDTH = 500
+            if a*y_eval**2 + b*y_eval + c > 320:
+                lane = Lane([0, 0, c-LINE_WIDTH]+list(m.data))
+            else:
+                lane = Lane(list(m.data)+[0, 0, c+LINE_WIDTH])
         self._up("lane", lane)
 
     def _cb_ar(self, m: Float32MultiArray) -> None:

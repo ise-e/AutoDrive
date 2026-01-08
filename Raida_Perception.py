@@ -11,10 +11,8 @@ from std_msgs.msg import Float32MultiArray
 
 class RaidaLanePrediction:
     """
-    LiDAR 기반 간단 PF 회피 노드
-    - LaserScan -> base_link 포인트 변환
-    - Potential Field로 방향(dir_deg) / 속도(vel) 생성
-    - ROI 내 점들을 x,y,r 리스트로 obstacles 토픽에 발행
+    라바콘 인식시 길이 6 리스트 publish.
+    인식 안될시 빈 배열 publish.
     """
 
     def __init__(self) -> None:
@@ -70,7 +68,7 @@ class RaidaLanePrediction:
                 y = -r * math.sin(angle)
                 points.append([x, y])
 
-        # --- [2] 유클리드 클러스터링 알고리즘 ---
+        # 유클리드 클러스터링 알고리즘
         clusters = []
         if len(points) > 0:
             current_cluster = [points[0]]

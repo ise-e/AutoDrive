@@ -167,23 +167,28 @@ class CameraPerception:
         lfit, rfit, stop, debug_bev = self._lane_stop(bev)
         self.pub_stop.publish(stop)
 
-        # /lane_coeffs: [la, lb, lc, ra, rb, rc]
+        # /lane_coeffs 발행 로직 수정
         if lfit is not None and rfit is not None:
+            # 양쪽 차선 모두 검지
             self.last_fit, self.last_fit_t = (lfit, rfit), now_sec()
             self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
+        elif lfit is not None:
+            # 왼쪽만 검지
+            self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+        elif rfit is not None:
+            # 오른쪽만 검지
+            self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
         else:
+            # 둘 다 미검지 시 이전 기록 유지 (Hold)
             if self.last_fit and (now_sec() - self.last_fit_t) <= self.hold_sec:
                 lf, rf = self.last_fit
                 self.pub_lane.publish(Float32MultiArray(data=list(lf) + list(rf)))
 
         if self.mstatus == "STOP":
-            # 신호등 탐지 함수 -> None 또는 업데이트 된 debug_frame 반환
             debug_frame = self._traffic_light(frame, debug_frame) or debug_frame
         if self.mstatus == "PARKING":
-            # AR Tag 탐지 함수 -> None 또는 업데이트 된 debug_frame 반환
             debug_frame = self._ar_tag(frame, debug_frame) or debug_frame
 
-        # debug 화면 두개 세로로 붙이기
         combined_view = np.hstack([debug_frame, debug_bev])
         self._publish_overlay(combined_view)
 
@@ -257,20 +262,25 @@ class CameraPerception:
             gr = ((nzy >= ylo) & (nzy < yhi) & (nzx >= rlo) & (nzx < rhi)).nonzero()[0]
             lidx.append(gl)
             ridx.append(gr)
-
+            
             if len(gl) > self.minpix:
                 lx = int(np.mean(nzx[gl]))
             if len(gr) > self.minpix:
                 rx = int(np.mean(nzx[gr]))
 
+        l_fit_res, r_fit_res = None, None
         try:
             li = np.concatenate(lidx) if lidx else np.array([], np.int32)
+            if len(li) >= self.minpts:
+                l_fit_res = np.polyfit(nzy[li], nzx[li], 2)
+            
             ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
-            if len(li) < self.minpts or len(ri) < self.minpts:
-                return None, None
-            return np.polyfit(nzy[li], nzx[li], 2), np.polyfit(nzy[ri], nzx[ri], 2)
+            if len(ri) >= self.minpts:
+                r_fit_res = np.polyfit(nzy[ri], nzx[ri], 2)
         except Exception:
-            return None, None
+            pass
+
+        return l_fit_res, r_fit_res
 
     @staticmethod
     def _poly_x(f, y):

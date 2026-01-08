@@ -316,19 +316,23 @@ class DecisionNode:
                 self._d[tkey] = now
 
     def _cb_lane(self, m: Float32MultiArray) -> None:
-        lane = Lane(list(m.data)) if (m.data and len(m.data) >= 6) else None
+        data = list(m.data) if m.data else []
+        n = len(data)
         y_eval = 480
-        if m.data is None:
-            lane = None
-        elif (m.data and len(m.data) >= 6):
-            lane = Lane(list(m.data))
+        LINE_WIDTH_PX = 300  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
+        if n >= 6:
+            # 양쪽 차선 정상 수신
+            lane = Lane(data)
+        elif n >= 3:
+            # 한쪽 차선만 수신 (a, b, c 추출)
+            a, b, c = data[0], data[1], data[2]
+            x_pos = a * (y_eval**2) + b * y_eval + c
+            if x_pos > 320: # 감지된 것이 오른쪽 차선일 때
+                lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
+            else: # 감지된 것이 왼쪽 차선일 때
+                lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])
         else:
-            a, b, c = lane.c
-            LINE_WIDTH = 500
-            if a*y_eval**2 + b*y_eval + c > 320:
-                lane = Lane([0, 0, c-LINE_WIDTH]+list(m.data))
-            else:
-                lane = Lane(list(m.data)+[0, 0, c+LINE_WIDTH])
+            lane = None
         self._up("lane", lane)
 
     def _cb_ar(self, m: Float32MultiArray) -> None:

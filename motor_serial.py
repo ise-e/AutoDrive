@@ -10,7 +10,7 @@ motor_serial_v1_patched.py
 
 v1 토픽 계약과의 호환:
 - 기본 motor_topic: "cmd/motor" (상대 토픽)
-  - launch에서 <group ns="orda">로 묶으면 /orda/cmd/motor 가 됩니다.
+- launch에서 <group ns="orda">로 묶으면 /orda/cmd/motor 가 됩니다.
 - 기존 "/motor"와도 호환: _motor_topic:=/motor 로 실행하면 됩니다.
 """
 

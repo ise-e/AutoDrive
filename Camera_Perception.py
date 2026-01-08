@@ -167,19 +167,45 @@ class CameraPerception:
         lfit, rfit, stop, debug_bev = self._lane_stop(bev)
         self.pub_stop.publish(stop)
 
-        # /lane_coeffs 발행 로직 수정
+        # 양쪽 차선 모두 검지
         if lfit is not None and rfit is not None:
-            # 양쪽 차선 모두 검지
-            self.last_fit, self.last_fit_t = (lfit, rfit), now_sec()
-            self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
+            # 이미지 최하단
+            y_bot = self.h - 1
+            # 이미지 상단
+            y_top = int(self.h * 0.3)
+            # 각 지점에서의 너비 계산
+            w_bot = self._poly_x(rfit, y_bot) - self._poly_x(lfit, y_bot)
+            w_top = self._poly_x(rfit, y_top) - self._poly_x(lfit, y_top)
+            # 너비 변화량 (Width Deviation)
+            width_deviation = abs(w_top - w_bot)
+            # 차이가 60 이상일 경우 **값 조정 필요
+            if width_deviation > 60:
+                if w_top < w_bot:  # 상단으로 갈수록 너비가 좁아지는 경우 (수렴)
+                    if self.mdir == "LEFT":
+                        # 왼쪽으로 가야 하는데 왼쪽이 좁아지면, 확실한 오른쪽 선을 기준으로 주행
+                        self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+                    else: # RIGHT 미션
+                        # 오른쪽으로 가야 하는데 오른쪽이 좁아지면, 왼쪽 선을 기준으로 주행
+                        self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+                else:  # 상단으로 갈수록 너비가 넓어지는 경우 (발산/갈림길)
+                    if self.mdir == "LEFT":
+                        # 왼쪽 갈림길을 타기 위해 왼쪽 차선을 가이드로 선택
+                        self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+                    else: # RIGHT 미션
+                        # 오른쪽 갈림길을 타기 위해 오른쪽 차선을 가이드로 선택
+                        self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+            # 정상적인 경우
+            else :
+                self.last_fit, self.last_fit_t = (lfit, rfit), now_sec()
+                self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
+        # 왼쪽만 검지
         elif lfit is not None:
-            # 왼쪽만 검지
             self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+        # 오른쪽만 검지
         elif rfit is not None:
-            # 오른쪽만 검지
             self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+        # 둘 다 미검지 ** 이 부분은 나중에 판단 노드로 옮길 생각입니다
         else:
-            # 둘 다 미검지 시 이전 기록 유지 (Hold)
             if self.last_fit and (now_sec() - self.last_fit_t) <= self.hold_sec:
                 lf, rf = self.last_fit
                 self.pub_lane.publish(Float32MultiArray(data=list(lf) + list(rf)))

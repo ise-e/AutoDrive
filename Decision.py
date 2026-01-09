@@ -45,12 +45,10 @@ class Snap:
     """루프 1회에서 사용하는 입력 스냅샷(원자적 캡처)"""
     t: float
     lane: Optional[Lane]
+    obs_lane: Optional[Lane]
     stop: str
     light: str
     ar: Optional[Tuple[float, float]]   # (dist_m, ang_rad)
-    pf_dir: Optional[float]             # deg
-    pf_vel: Optional[float]             # speed suggestion (0~100)
-
 
 @dataclass
 class FsmOut:
@@ -243,13 +241,6 @@ class DecisionNode:
             "t_db": float(gp("stopline_debounce_sec", 1.0)),
             "dist_p": float(gp("park_stop_dist_m", 0.3)),
 
-            # PF
-            "pf_enable": bool(gp("pf_enable", True)),
-            "pf_timeout": float(gp("pf_timeout", 0.3)),
-            "pf_gain_deg_to_steer": float(gp("pf_gain_deg_to_steer", 0.8)),
-            "pf_blend_max": float(gp("pf_blend_max", 0.65)),
-            "pf_blend_angle_deg": float(gp("pf_blend_angle_deg", 45.0)),
-
             # lane eval
             "lane_eval_y": float(gp("lane_eval_y", -1.0)),
 
@@ -278,11 +269,10 @@ class DecisionNode:
         self.lock = threading.RLock()
         self._d: Dict[str, Any] = {
             "lane": None,
+            "obs_lane": None,
             "stop": "NONE",
             "light": "UNKNOWN",
             "ar": None,
-            "pf_dir": None, "pf_dir_t": 0.0,
-            "pf_vel": None, "pf_vel_t": 0.0,
         }
 
         # --- publishers ---
@@ -296,12 +286,10 @@ class DecisionNode:
 
         # --- subscribers ---
         rospy.Subscriber("/lane_coeffs", Float32MultiArray, self._cb_lane, queue_size=1)
+        rospy.Subscriber("/obs_lane_coeffs", Float32MultiArray, self._cb_obs_lane, queue_size=1)
         rospy.Subscriber("/stop_line_status", String, lambda m: self._up("stop", (m.data or "NONE").upper()), queue_size=1)
         rospy.Subscriber("/traffic_light_status", String, lambda m: self._up("light", (m.data or "UNKNOWN").upper()), queue_size=1)
         rospy.Subscriber("/ar_tag_info", Float32MultiArray, self._cb_ar, queue_size=1)
-
-        rospy.Subscriber("/tunnel/direction", Float32, lambda m: self._up("pf_dir", float(m.data), "pf_dir_t"), queue_size=1)
-        rospy.Subscriber("/tunnel/velocity", Float32, lambda m: self._up("pf_vel", float(m.data), "pf_vel_t"), queue_size=1)
 
         self._ts_ar_missing = 0.0
 
@@ -316,20 +304,32 @@ class DecisionNode:
                 self._d[tkey] = now
 
     def _cb_lane(self, m: Float32MultiArray) -> None:
-        lane = Lane(list(m.data)) if (m.data and len(m.data) >= 6) else None
+        data = list(m.data) if m.data else []
+        n = len(data)
         y_eval = 480
-        if m.data is None:
-            lane = None
-        elif (m.data and len(m.data) >= 6):
-            lane = Lane(list(m.data))
+        LINE_WIDTH_PX = 300  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
+        if n >= 6:
+            # 양쪽 차선 정상 수신
+            lane = Lane(data)
+        elif n >= 3:
+            # 한쪽 차선만 수신 (a, b, c 추출)
+            a, b, c = data[0], data[1], data[2]
+            x_pos = a * (y_eval**2) + b * y_eval + c
+            if x_pos > 320: # 감지된 것이 오른쪽 차선일 때
+                lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
+            else: # 감지된 것이 왼쪽 차선일 때
+                lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])
         else:
-            a, b, c = lane.c
-            LINE_WIDTH = 500
-            if a*y_eval**2 + b*y_eval + c > 320:
-                lane = Lane([0, 0, c-LINE_WIDTH]+list(m.data))
-            else:
-                lane = Lane(list(m.data)+[0, 0, c+LINE_WIDTH])
+            lane = None
         self._up("lane", lane)
+
+    def _cb_obs_lane(self, m: Float32MultiArray) -> None:
+        data = list(m.data) if len(m.data) else []
+        if len(data):
+            obs_lane = Lane(data)
+        else:
+            obs_lane = None
+        self._up("obs_lane", obs_lane)
 
     def _cb_ar(self, m: Float32MultiArray) -> None:
         # format: [id, dist, ang(rad)]
@@ -339,16 +339,13 @@ class DecisionNode:
     def _capture(self) -> Snap:
         t = rospy.get_time()
         with self.lock:
-            pf_dir = self._d["pf_dir"] if (t - self._d["pf_dir_t"]) <= self.cfg.pf_timeout else None
-            pf_vel = self._d["pf_vel"] if (t - self._d["pf_vel_t"]) <= self.cfg.pf_timeout else None
             return Snap(
                 t=t,
                 lane=self._d["lane"],
+                obs_lane=self._d["obs_lane"],
                 stop=self._d["stop"],
                 light=self._d["light"],
                 ar=self._d["ar"],
-                pf_dir=pf_dir,
-                pf_vel=pf_vel,
             )
 
     # ---------------- Main loop ----------------
@@ -390,32 +387,28 @@ class DecisionNode:
         speed = int(self.cfg.spd_drive)
 
         # 1) Lane -> steer
-        if s.lane:
+        if s.obs_lane:
+            err_norm = s.obs_lane.x_center(1.0)
+            p_term = err_norm * float(self.cfg.kp)
+            d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
+        elif s.lane:
             y = (self.cfg.h - 1) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w) * 0.5)
             err_norm = (half_w - s.lane.x_center(y)) / half_w
             p_term = err_norm * float(self.cfg.kp) 
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
-            self.accum_error += err_norm
-            i_term = self.accum_error * float(self.cfg.ki)
-            steer = self.cfg.cen + int(p_term + d_term + i_term)
-            self.prev_error = err_norm
-            steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+        else:
+            err_norm = 0.0
+            p_term = 0.0
+            d_term = 0.0
 
-        # 2) PF blend (optional)
-        if self.cfg.pf_enable and (s.pf_dir is not None):
-            d = float(s.pf_dir)
-            d = d if d <= 180.0 else (d - 360.0)  # [-180, 180]
-            pf_steer = float(self.cfg.cen) - float(d) * float(self.cfg.pf_gain_deg_to_steer)
-            w = min(abs(d) / max(float(self.cfg.pf_blend_angle_deg), 1e-6), 1.0) * float(self.cfg.pf_blend_max)
-            steer = int((1.0 - w) * float(steer) + w * pf_steer)
-            steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+        self.accum_error += err_norm
+        i_term = self.accum_error * float(self.cfg.ki)
+        steer = self.cfg.cen + int(p_term + d_term + i_term)
+        self.prev_error = err_norm
+        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 
-            if s.pf_vel is not None:
-                # PF가 제안하는 속도가 너무 낮아(=정지영역)지지 않도록 floor 적용
-                speed = max(int(self.cfg.speed_min_run), min(int(speed), int(s.pf_vel)))
-
-                # 90~97은 정지로 해석되는 경우가 있어, 주행 중에는 최소 속도를 보장
+        # 90~97은 정지로 해석되는 경우가 있어, 주행 중에는 최소 속도를 보장
         speed = max(int(speed), int(self.cfg.speed_min_run))
         return int(steer), int(speed)
 

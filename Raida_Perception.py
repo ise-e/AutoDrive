@@ -117,8 +117,8 @@ class RaidaLanePrediction:
 
         for point in obstacle_center_arr:
             if len(right_line) and len(left_line):
-                dist_to_left = np.sum((left_line[-1]-point[:2])**2)
-                dist_to_right = np.sum((right_line[-1]-point[:2])**2)
+                dist_to_left = np.sum((left_line[-1][0:2]-point[:2])**2)
+                dist_to_right = np.sum((right_line[-1][0:2]-point[:2])**2)
 
                 if dist_to_left < dist_to_right:
                     left_line.append(point)
@@ -166,11 +166,12 @@ class RaidaLanePrediction:
         rospy.loginfo_throttle(1.0, 
         f"[Lane] Left:{len(left_line)} Right:{len(right_line)} -> Path Detected Check: {self.isdetected}")
 
-        self.viz()
-
 
     def run(self) -> None:
-        rospy.spin()
+        rate = rospy.Rate(30) # 30Hz
+        while not rospy.is_shutdown():
+            self.viz()
+            rate.sleep()
 
     def viz(self):
         # 배경 생성 (검은색)

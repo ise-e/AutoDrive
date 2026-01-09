@@ -216,6 +216,7 @@ class DecisionNode:
 
         self.accum_error = 0
         self.prev_error = 0
+        self.prev_steer = None
         
         # --- config ---
         self.cfg = type("Cfg", (), {
@@ -223,7 +224,7 @@ class DecisionNode:
             "cen": int(gp("steer_center", 90)),
             "min": int(gp("steer_min", 45)),
             "max": int(gp("steer_max", 135)),
-            "kp": float(gp("kp_steer", 45.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
+            "kp": float(gp("kp_steer", 30.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
             "kd": float(gp("kd_steer", 0)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
             "ki": float(gp("ki_steer", 0)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
             "spd_drive": int(gp("speed_drive", 100)),
@@ -406,6 +407,15 @@ class DecisionNode:
         i_term = self.accum_error * float(self.cfg.ki)
         steer = self.cfg.cen + int(p_term + d_term + i_term)
         self.prev_error = err_norm
+        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+
+        target_steer = self.cfg.cen + int(p_term + d_term + i_term)
+
+        if self.prev_steer:
+            alpha = 0.7  ## 직전 조향각의 70퍼센트 유지
+            steer = int(alpha * self.prev_steer + (1 - alpha) * target_steer)
+
+        self.prev_steer = steer
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 
         # 90~97은 정지로 해석되는 경우가 있어, 주행 중에는 최소 속도를 보장

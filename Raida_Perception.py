@@ -5,9 +5,15 @@ import math
 from typing import Tuple, Optional
 
 import numpy as np
+import cv2
 import rospy
+
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray
+
+WIDTH, HEIGHT = 640, 480
+CENTER = (WIDTH // 2, HEIGHT - 50)
+SCALE = 80
 
 class RaidaLanePrediction:
     """
@@ -24,6 +30,12 @@ class RaidaLanePrediction:
         self.max_cluster_size = 30     # 라바콘 크기를 고려한 최대 점 개수
         self.roi_front_limit = 3.0     # 전방 탐색 제한 거리 (m) 
         self.isdetected = False         # 라인 감지 확인용
+
+        # 시각화용 데이터 저장 변수
+        self.viz_points = []
+        self.viz_cones_left = []
+        self.viz_cones_right = []
+        self.viz_coeffs = []
 
         # 구독자 및 발행자 초기화
         self.scan_sub = rospy.Subscriber("/scan", LaserScan, self.scan_callback)
@@ -67,6 +79,8 @@ class RaidaLanePrediction:
                 x = -r * math.cos(angle)
                 y = -r * math.sin(angle)
                 points.append([x, y])
+
+        self.viz_points = points
 
         # 유클리드 클러스터링 알고리즘
         clusters = []
@@ -116,6 +130,9 @@ class RaidaLanePrediction:
                 else:
                     right_line.append(point)
 
+        self.viz_cones_left = left_line
+        self.viz_cones_right = right_line
+
         # 포맷: [L_a, L_b, L_c,  R_a, R_b, R_c]
         if len(points) == 0 or len(right_line) < 3 or len(left_line) < 3: 
             # 라바콘이 없거나 둘중 한쪽 차선의 라바콘이 2개 이하일 때, 장애물 없다고 판단.
@@ -139,6 +156,8 @@ class RaidaLanePrediction:
             model = np.polyfit(rx, ry, 2)
             coeffs[3], coeffs[4], coeffs[5] = model[0], model[1], model[2]
 
+        self.viz_coeffs = coeffs
+
         # 데이터 pub류
         msg = Float32MultiArray()
         msg.data = coeffs
@@ -147,10 +166,101 @@ class RaidaLanePrediction:
         rospy.loginfo_throttle(1.0, 
         f"[Lane] Left:{len(left_line)} Right:{len(right_line)} -> Path Detected Check: {self.isdetected}")
 
+        self.viz()
+
 
     def run(self) -> None:
         rospy.spin()
 
+    def viz(self):
+        # 배경 생성 (검은색)
+        img = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+
+        cv2.line(img, (CENTER[0], 0), (CENTER[0], HEIGHT), (60, 60, 60), 1)
+        # 가로선 (차량 위치)
+        cv2.line(img, (0, CENTER[1]), (WIDTH, CENTER[1]), (60, 60, 60), 1)
+
+        # 2. Raw LiDAR Points 그리기
+        # ROS 좌표: X(Forward), Y(Left)
+        # 이미지 좌표: X(Right), Y(Down)
+        # 변환: ImgX = CENTER[0] - Y*SCALE (좌우 반전 주의: ROS Y+는 왼쪽이므로 화면 왼쪽으로 가려면 빼야함)
+        #       ImgY = CENTER[1] - X*SCALE (전방은 화면 위쪽이므로 빼야함)
+        for (x, y) in self.viz_points:
+            px = int(CENTER[0] - y * SCALE)  # Y(Left)를 가로축으로
+            py = int(CENTER[1] - x * SCALE)  # X(Forward)를 세로축으로
+            
+            # 거리별 색상
+            dist = math.sqrt(x*x + y*y)
+            if dist < 1.0: color = (0, 0, 255)    # Red (Near)
+            elif dist < 2.0: color = (0, 255, 255) # Yellow
+            else: color = (0, 255, 0)              # Green (Far)
+
+            # 화면 안에 들어오는 점만 그리기
+            if 0 <= px < WIDTH and 0 <= py < HEIGHT:
+                cv2.circle(img, (px, py), 1, color, -1)
+
+        # 3. 인식된 라바콘(Cluster Centers) 그리기
+        # 왼쪽 콘: 파란색
+        for p in self.viz_cones_left:
+            px = int(CENTER[0] - p[1] * SCALE)
+            py = int(CENTER[1] - p[0] * SCALE)
+            if 0 <= px < WIDTH and 0 <= py < HEIGHT:
+                cv2.circle(img, (px, py), 5, (255, 0, 0), 2) # Blue Circle
+
+        # 오른쪽 콘: 빨간색
+        for p in self.viz_cones_right:
+            px = int(CENTER[0] - p[1] * SCALE)
+            py = int(CENTER[1] - p[0] * SCALE)
+            if 0 <= px < WIDTH and 0 <= py < HEIGHT:
+                cv2.circle(img, (px, py), 5, (0, 0, 255), 2) # Red Circle
+
+        # 4. 피팅된 차선 및 주행 경로(Line) 그리기
+        if self.isdetected and len(self.viz_coeffs) == 6:
+            la, lb, lc = self.viz_coeffs[0:3]
+            ra, rb, rc = self.viz_coeffs[3:6]
+            
+            # 그릴 점들 계산 (전방 0m ~ 3.5m)
+            x_vals = np.arange(0, 3.5, 0.1)
+            
+            pts_left = []
+            pts_right = []
+            pts_center = []
+
+            for x in x_vals:
+                # 다항식 계산: y = ax^2 + bx + c
+                ly = la * x**2 + lb * x + lc  # 왼쪽 차선 Y좌표(Lateral)
+                ry = ra * x**2 + rb * x + rc  # 오른쪽 차선 Y좌표(Lateral)
+                cy = (ly + ry) / 2.0          # 중앙 경로
+
+                # 이미지 좌표 변환
+                # ImgX = CENTER[0] - Lateral * SCALE
+                # ImgY = CENTER[1] - Forward * SCALE
+                
+                # 유효성 체크 (너무 멀리 튄 값 제외)
+                if abs(ly) < 3.0:
+                    pts_left.append([int(CENTER[0] - ly * SCALE), int(CENTER[1] - x * SCALE)])
+                if abs(ry) < 3.0:
+                    pts_right.append([int(CENTER[0] - ry * SCALE), int(CENTER[1] - x * SCALE)])
+                if abs(cy) < 3.0:
+                    pts_center.append([int(CENTER[0] - cy * SCALE), int(CENTER[1] - x * SCALE)])
+
+            # 선 그리기 (Polylines)
+            if len(pts_left) > 1 and (la!=0 or lb!=0):
+                cv2.polylines(img, [np.array(pts_left, dtype=np.int32)], False, (255, 100, 0), 2) # 하늘색
+            
+            if len(pts_right) > 1 and (ra!=0 or rb!=0):
+                cv2.polylines(img, [np.array(pts_right, dtype=np.int32)], False, (0, 100, 255), 2) # 주황색
+
+            if len(pts_center) > 1:
+                cv2.polylines(img, [np.array(pts_center, dtype=np.int32)], False, (0, 255, 0), 2) # 녹색 (주행경로)
+
+        # 텍스트 정보 출력
+        status = "Detected" if self.isdetected else "Searching..."
+        cv2.putText(img, f"Status: {status}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # 화면 출력
+        cv2.imshow("LiDAR Lane Prediction", img)
+        cv2.waitKey(1)
 
 if __name__ == "__main__":
     RaidaLanePrediction().run()

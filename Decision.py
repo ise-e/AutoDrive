@@ -399,9 +399,9 @@ class DecisionNode:
             p_term = err_norm * float(self.cfg.kp) 
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         else:
-            err_norm = 0.0
-            p_term = 0.0
-            d_term = 0.0
+            self.accum_error = 0.0
+            self.prev_error = 0.0
+            return int(self.cfg.cen), max(int(speed), int(self.cfg.speed_min_run))
 
         self.accum_error += err_norm
         i_term = self.accum_error * float(self.cfg.ki)

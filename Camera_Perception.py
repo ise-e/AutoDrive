@@ -206,9 +206,7 @@ class CameraPerception:
             self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
         # 둘 다 미검지 ** 이 부분은 나중에 판단 노드로 옮길 생각입니다
         else:
-            if self.last_fit and (now_sec() - self.last_fit_t) <= self.hold_sec:
-                lf, rf = self.last_fit
-                self.pub_lane.publish(Float32MultiArray(data=list(lf) + list(rf)))
+            self.pub_lane.publish(Float32MultiArray(data=[]))
 
         if self.mstatus == "STOP":
             debug_frame = self._traffic_light(frame, debug_frame)

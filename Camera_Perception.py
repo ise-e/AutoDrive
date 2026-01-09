@@ -211,9 +211,12 @@ class CameraPerception:
                 self.pub_lane.publish(Float32MultiArray(data=list(lf) + list(rf)))
 
         if self.mstatus == "STOP":
-            debug_frame = self._traffic_light(frame, debug_frame) or debug_frame
+            debug_frame = self._traffic_light(frame, debug_frame)
+            
         if self.mstatus == "PARKING":
-            debug_frame = self._ar_tag(frame, debug_frame) or debug_frame
+            res = self._ar_tag(frame, debug_frame)
+            if res is not None:
+                debug_frame = res
 
         combined_view = np.hstack([debug_frame, debug_bev])
         self._publish_overlay(combined_view)

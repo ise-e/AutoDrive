@@ -307,16 +307,16 @@ class DecisionNode:
     def _cb_lane(self, m: Float32MultiArray) -> None:
         data = list(m.data) if m.data else []
         n = len(data)
-        y_eval = 480
-        LINE_WIDTH_PX = 300  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
+        y_eval = 200
+        LINE_WIDTH_PX = 400  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
         if n >= 6:
             # 양쪽 차선 정상 수신
             lane = Lane(data)
         elif n >= 3:
             # 한쪽 차선만 수신 (a, b, c 추출)
             a, b, c = data[0], data[1], data[2]
-            x_pos = a * (y_eval**2) + b * y_eval + c
-            if x_pos > 320: # 감지된 것이 오른쪽 차선일 때
+            grad = 2*a*y_eval + b*y_eval
+            if grad < 0: # 감지된 것이 오른쪽 차선일 때
                 lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
             else: # 감지된 것이 왼쪽 차선일 때
                 lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])

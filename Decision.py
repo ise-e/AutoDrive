@@ -405,7 +405,7 @@ class DecisionNode:
 
         self.accum_error += err_norm
         i_term = self.accum_error * float(self.cfg.ki)
-        steer = self.cfg.cen + int(p_term + d_term + i_term)
+        steer = self.cfg.cen - int(p_term + d_term + i_term)
         self.prev_error = err_norm
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 

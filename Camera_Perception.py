@@ -206,9 +206,7 @@ class CameraPerception:
             self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
         # 둘 다 미검지 ** 이 부분은 나중에 판단 노드로 옮길 생각입니다
         else:
-            if self.last_fit and (now_sec() - self.last_fit_t) <= self.hold_sec:
-                lf, rf = self.last_fit
-                self.pub_lane.publish(Float32MultiArray(data=list(lf) + list(rf)))
+            self.pub_lane.publish(Float32MultiArray(data=[]))
 
         if self.mstatus == "STOP":
             debug_frame = self._traffic_light(frame, debug_frame)
@@ -317,42 +315,67 @@ class CameraPerception:
 
     def _debug_line(self, bev, lane, lf, rf, stop, ypx, wpx, color):
         debug_bev = bev.copy()
+        # 차선 마스크(흰/노랑)를 초록 채널에 섞어서 표시
         debug_bev[:, :, 1] = np.maximum(debug_bev[:, :, 1], (lane // 2).astype(np.uint8))
 
-        # ===== [DEBUG] 시각화 코드 ========
+        h, w = debug_bev.shape[:2]
+
+        # 1. 정지선 박스 그리기
         if color != "NONE":
-            h, w = debug_bev.shape[:2]
             y0 = int(self.stop_y0 * h)
             y1 = int(self.stop_y1 * h)
-
             box_color = (0, 255, 255) if stop == "YELLOW" else (200, 200, 200)
-
             cv2.rectangle(debug_bev, (0, y0), (w, y1), box_color, 4)
-
-            cv2.putText(debug_bev, f"{stop} LINE", (w//2 - 100, y0 - 10),
+            cv2.putText(debug_bev, f"{stop} LINE", (w // 2 - 100, y0 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, box_color, 2)
-        # ================================
 
-        ok = (lf is not None and rf is not None)
-        if ok:
-            ptsL, ptsR, ptsC = [], [], []
-            h, w = debug_bev.shape[:2]
-            for y in range(h - 1, 0, -20):
-                lx, rx = self._poly_x(lf, y), self._poly_x(rf, y)
-                if 0 <= lx < w and 0 <= rx < w:
-                    cx = 0.5 * (lx + rx)
+        # 2. 차선 시각화 (각각 독립적으로 수행)
+        ptsL, ptsR = [], []
+        
+        # Y좌표 생성 (이미지 하단 -> 상단)
+        plot_y = np.linspace(h - 1, 0, h // 20).astype(int)
+
+        # (1) 왼쪽 차선 그리기
+        if lf is not None:
+            for y in plot_y:
+                lx = self._poly_x(lf, y)
+                if 0 <= lx < w:
                     ptsL.append((int(lx), y))
+            if len(ptsL) >= 2:
+                cv2.polylines(debug_bev, [np.array(ptsL)], False, (255, 0, 0), 2)  # 파란색
+
+        # (2) 오른쪽 차선 그리기
+        if rf is not None:
+            for y in plot_y:
+                rx = self._poly_x(rf, y)
+                if 0 <= rx < w:
                     ptsR.append((int(rx), y))
+            if len(ptsR) >= 2:
+                cv2.polylines(debug_bev, [np.array(ptsR)], False, (0, 0, 255), 2)  # 빨간색
+
+        # (3) 주행 중심선 그리기 (양쪽 다 있을 때만)
+        if lf is not None and rf is not None:
+            ptsC = []
+            for y in plot_y:
+                lx = self._poly_x(lf, y)
+                rx = self._poly_x(rf, y)
+                if 0 <= lx < w and 0 <= rx < w:
+                    cx = (lx + rx) * 0.5
                     ptsC.append((int(cx), y))
             if len(ptsC) >= 2:
-                cv2.polylines(debug_bev, [np.array(ptsL)], False, (255, 0, 0), 2)
-                cv2.polylines(debug_bev, [np.array(ptsR)], False, (0, 0, 255), 2)
-                cv2.polylines(debug_bev, [np.array(ptsC)], False, (80, 255, 80), 2)
+                cv2.polylines(debug_bev, [np.array(ptsC)], False, (0, 255, 0), 2)  # 초록색
 
-        cv2.putText(debug_bev, f"{self.mdir} {self.mstatus} STOP:{stop} FIT:{'OK' if ok else 'NO'}",
+        # 3. 상태 텍스트
+        detect_status = []
+        if lf is not None: detect_status.append("L")
+        if rf is not None: detect_status.append("R")
+        detect_str = "+".join(detect_status) if detect_status else "NONE"
+
+        cv2.putText(debug_bev, f"{self.mdir} {self.mstatus} STOP:{stop} DET:{detect_str}",
                     (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
         cv2.putText(debug_bev, f"Y:{ypx} W:{wpx}", (10, 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
+        
         return debug_bev
 
     # 신호등 탐지 시각화 함수
@@ -387,9 +410,10 @@ class CameraPerception:
             return
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         ar = cv2.aruco
-        dic = ar.Dictionary_get(ar.DICT_6X6_250)
-        prm = ar.DetectorParameters_create()
-        corners, ids, _ = ar.detectMarkers(gray, dic, parameters=prm)
+        dic = ar.getPredefinedDictionary(ar.DICT_6X6_250)
+        prm = ar.DetectorParameters()
+        detector = ar.ArucoDetector(dic, prm)
+        corners, ids, _ = detector.detectMarkers(gray)
         if ids is None:
             return
 

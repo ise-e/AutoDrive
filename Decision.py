@@ -216,6 +216,7 @@ class DecisionNode:
 
         self.accum_error = 0
         self.prev_error = 0
+        self.prev_steer = None
         
         # --- config ---
         self.cfg = type("Cfg", (), {
@@ -224,8 +225,8 @@ class DecisionNode:
             "min": int(gp("steer_min", 45)),
             "max": int(gp("steer_max", 135)),
             "kp": float(gp("kp_steer", 45.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
-            "kd": float(gp("kd_steer", 0)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
-            "ki": float(gp("ki_steer", 0)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
+            "kd": float(gp("kd_steer", 15)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
+            "ki": float(gp("ki_steer", 0.0001)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
             "spd_drive": int(gp("speed_drive", 100)),
             "spd_stop": int(gp("speed_stop", 90)),
             "spd_parking": int(gp("speed_parking", 99)),
@@ -306,16 +307,16 @@ class DecisionNode:
     def _cb_lane(self, m: Float32MultiArray) -> None:
         data = list(m.data) if m.data else []
         n = len(data)
-        y_eval = 480
-        LINE_WIDTH_PX = 300  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
+        y_eval = 200
+        LINE_WIDTH_PX = 400  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
         if n >= 6:
             # 양쪽 차선 정상 수신
             lane = Lane(data)
         elif n >= 3:
             # 한쪽 차선만 수신 (a, b, c 추출)
             a, b, c = data[0], data[1], data[2]
-            x_pos = a * (y_eval**2) + b * y_eval + c
-            if x_pos > 320: # 감지된 것이 오른쪽 차선일 때
+            grad = 2*a*y_eval + b*y_eval
+            if grad < 0: # 감지된 것이 오른쪽 차선일 때
                 lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
             else: # 감지된 것이 왼쪽 차선일 때
                 lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])
@@ -388,7 +389,7 @@ class DecisionNode:
 
         # 1) Lane -> steer
         if s.obs_lane:
-            err_norm = s.obs_lane.x_center(1.0)
+            err_norm = s.obs_lane.x_center(0.3)
             p_term = err_norm * float(self.cfg.kp)
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         elif s.lane:
@@ -398,14 +399,23 @@ class DecisionNode:
             p_term = err_norm * float(self.cfg.kp) 
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         else:
-            err_norm = 0.0
-            p_term = 0.0
-            d_term = 0.0
+            self.accum_error = 0.0
+            self.prev_error = 0.0
+            return int(self.cfg.cen), max(int(speed), int(self.cfg.speed_min_run))
 
         self.accum_error += err_norm
         i_term = self.accum_error * float(self.cfg.ki)
-        steer = self.cfg.cen + int(p_term + d_term + i_term)
+        steer = self.cfg.cen - int(p_term + d_term + i_term)
         self.prev_error = err_norm
+        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+
+        target_steer = self.cfg.cen + int(p_term + d_term + i_term)
+
+        if self.prev_steer:
+            alpha = 0.0  ## 현재 kd와 기능이 겹쳐 비활성화, 추후 제거
+            steer = int(alpha * self.prev_steer + (1 - alpha) * target_steer)
+
+        self.prev_steer = steer
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 
         # 90~97은 정지로 해석되는 경우가 있어, 주행 중에는 최소 속도를 보장

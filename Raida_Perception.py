@@ -142,14 +142,13 @@ class RaidaLanePrediction:
             coeffs = [0.0] * 6 
             self.isdetected = True
 
-        if len(left_line) >= 3:
+        if self.isdetected:
             lx = [p[0] for p in left_line]
             ly = [p[1] for p in left_line]
             
             model = np.polyfit(lx, ly, 2) 
             coeffs[0], coeffs[1], coeffs[2] = model[0], model[1], model[2]
         
-        if len(right_line) >= 3:
             rx = [p[0] for p in right_line]
             ry = [p[1] for p in right_line]
             

@@ -412,7 +412,7 @@ class DecisionNode:
         target_steer = self.cfg.cen + int(p_term + d_term + i_term)
 
         if self.prev_steer:
-            alpha = 0.7  ## 직전 조향각의 70퍼센트 유지
+            alpha = 0.0  ## 현재 kd와 기능이 겹쳐 비활성화, 추후 제거
             steer = int(alpha * self.prev_steer + (1 - alpha) * target_steer)
 
         self.prev_steer = steer

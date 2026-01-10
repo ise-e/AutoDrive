@@ -28,7 +28,7 @@ class RaidaLanePrediction:
         self.distance_threshold = 0.1  # 같은 물체로 판단할 점들 사이의 최대 거리 (m)
         self.min_cluster_size = 3      # 유효한 물체로 볼 최소 점 개수
         self.max_cluster_size = 30     # 라바콘 크기를 고려한 최대 점 개수
-        self.roi_front_limit = 3.0     # 전방 탐색 제한 거리 (m) 
+        self.roi_front_limit = 1.0     # 전방 탐색 제한 거리 (m) 
         self.isdetected = False         # 라인 감지 확인용
 
         # 시각화용 데이터 저장 변수

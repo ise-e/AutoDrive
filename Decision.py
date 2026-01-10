@@ -389,7 +389,7 @@ class DecisionNode:
 
         # 1) Lane -> steer
         if s.obs_lane:
-            err_norm = s.obs_lane.x_center(1.0)
+            err_norm = s.obs_lane.x_center(0.3)
             p_term = err_norm * float(self.cfg.kp)
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         elif s.lane:

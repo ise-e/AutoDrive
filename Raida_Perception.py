@@ -191,8 +191,8 @@ class RaidaLanePrediction:
             
             # 거리별 색상
             dist = math.sqrt(x*x + y*y)
-            if dist < 1.0: color = (0, 0, 255)    # Red (Near)
-            elif dist < 2.0: color = (0, 255, 255) # Yellow
+            if dist < 0.3: color = (0, 0, 255)    # Red (Near)
+            elif dist < 0.6: color = (0, 255, 255) # Yellow
             else: color = (0, 255, 0)              # Green (Far)
 
             # 화면 안에 들어오는 점만 그리기

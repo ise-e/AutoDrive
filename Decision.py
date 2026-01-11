@@ -244,6 +244,7 @@ class DecisionNode:
 
             # lane eval
             "lane_eval_y": float(gp("lane_eval_y", -1.0)),
+            "obs_eval_x": float(gp("obs_eval_x", 0.5)),
 
             # parking search (AR 없을 때)
             "park_search_sec": float(gp("park_search_sec", 1.0)),
@@ -389,14 +390,15 @@ class DecisionNode:
 
         # 1) Lane -> steer
         if s.obs_lane:
-            err_norm = s.obs_lane.x_center(0.3)
-            p_term = err_norm * float(self.cfg.kp)
-            d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
+            speed = 98
+            err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
+            p_term = err_norm * float(self.cfg.kp * 5)
+            d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
         elif s.lane:
             y = (self.cfg.h - 1) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w) * 0.5)
             err_norm = (half_w - s.lane.x_center(y)) / half_w
-            p_term = err_norm * float(self.cfg.kp) 
+            p_term = err_norm * float(self.cfg.kp)
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         else:
             self.accum_error = 0.0
@@ -409,7 +411,7 @@ class DecisionNode:
         self.prev_error = err_norm
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 
-        target_steer = self.cfg.cen + int(p_term + d_term + i_term)
+        target_steer = self.cfg.cen - int(p_term + d_term + i_term)
 
         if self.prev_steer:
             alpha = 0.0  ## 현재 kd와 기능이 겹쳐 비활성화, 추후 제거
@@ -508,8 +510,8 @@ class DecisionNode:
 
     # ---------------- utils ----------------
     @staticmethod
-    def _clamp_i(v: int, lo: int, hi: int) -> int:
-        return max(int(lo), min(int(hi), int(v)))
+    def _clamp_i(v: int, low: int, high: int) -> int:
+        return max(int(low), min(int(high), int(v)))
 
 
 if __name__ == "__main__":

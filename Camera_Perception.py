@@ -73,8 +73,12 @@ class CameraPerception:
         # ---------- stopline ----------
         self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
         self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
-        self.stop_thr = float(get_param("~stop_px_per_col", 15.0))
+        self.stop_thr = float(get_param("~stop_px_per_col", 7.0))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
+
+        # 정지선 검증을 위한 파라미터
+        self.stop_line_angle_thr = float(get_param("~stop_line_angle_threshold", 20.0))  # 수평선 허용 각도
+        self.stop_line_min_length = float(get_param("~stop_line_min_length", 100.0))  # 최소 선 길이
 
         # ---------- dropout hold ----------
         self.hold_sec = float(get_param("~last_fit_hold_sec", 0.5))
@@ -206,7 +210,12 @@ class CameraPerception:
             self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
         # 둘 다 미검지 ** 이 부분은 나중에 판단 노드로 옮길 생각입니다
         else:
-            self.pub_lane.publish(Float32MultiArray(data=[]))
+            if self.last_fit is not None and (now_sec() - self.last_fit_t) < self.hold_sec:
+                lfit_last, rfit_last = self.last_fit
+                self.pub_lane.publish(Float32MultiArray(data=list(lfit_last) + list(rfit_last)))
+            else:
+                self.pub_lane.publish(Float32MultiArray(data=[]))
+            
 
         if self.mstatus == "STOP":
             debug_frame = self._traffic_light(frame, debug_frame)
@@ -227,12 +236,34 @@ class CameraPerception:
         wmask = cv2.inRange(hsv, *self.WHITE)
 
         h, w = ymask.shape
-        y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
-        if y1 <= y0:
-            y1 = min(h, y0 + 1)
+        stop_y0, stop_y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
 
-        ypx = cv2.countNonZero(ymask[y0:y1, :])
-        wpx = cv2.countNonZero(wmask[y0:y1, :])
+        # 차선 피팅용 전체 마스크 생성
+        lane_mask = cv2.bitwise_or(ymask, wmask)
+
+        # Sobel Y 연산, 수직 방향 그레이디언트 강조
+        gray_bev = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
+        sobely = cv2.Sobel(gray_bev, cv2.CV_64F, 0, 1, ksize=3)
+        sobely = cv2.convertScaleAbs(sobely)
+        _, stop_edge_mask = cv2.threshold(sobely, 40, 255, cv2.THRESH_BINARY)
+
+        # 정지선 후보 영역 추출
+        roi_stop_mask = lane_mask[stop_y0:stop_y1, :].copy()
+        
+        # 세로로 긴 커널을 사용하여 '차선'인 부분을 찾고, 이를 정지선 후보에서 뺍니다.
+        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+        lane_only_part = cv2.morphologyEx(roi_stop_mask, cv2.MORPH_OPEN, vert_kernel)
+        
+        # 정지선 후보 = (원본 마스크 - 세로 성분) & SobelY 가로 엣지
+        pure_stop_candidate = cv2.subtract(roi_stop_mask, lane_only_part)
+        pure_stop_candidate = cv2.bitwise_and(pure_stop_candidate, stop_edge_mask[stop_y0:stop_y1, :])
+
+        # 최종 가로 필터 적용
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+        final_stop_mask = cv2.morphologyEx(pure_stop_candidate, cv2.MORPH_OPEN, horiz_kernel)
+
+        ypx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, ymask[stop_y0:stop_y1, :]))
+        wpx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, wmask[stop_y0:stop_y1, :]))
 
         stop = "NONE"
         if ypx > w * self.stop_thr:
@@ -240,7 +271,9 @@ class CameraPerception:
         elif wpx > w * self.stop_thr:
             stop = "WHITE"
 
-        lane = cv2.bitwise_or(ymask, wmask)
+        lane = lane_mask.copy()
+        if stop != "NONE":
+            lane[stop_y0:stop_y1, :][final_stop_mask > 0] = 0
         cut = int(self.lane_cut * h)
         lane[cut:, :] = 0
         lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
@@ -299,7 +332,11 @@ class CameraPerception:
         try:
             li = np.concatenate(lidx) if lidx else np.array([], np.int32)
             if len(li) >= self.minpts:
-                l_fit_res = np.polyfit(nzy[li], nzx[li], 2)
+                if len(li) < self.minpts * 1.5: 
+                    tmp_f = np.polyfit(nzy[li], nzx[li], 1)
+                    l_fit_res = np.array([0.0, tmp_f[0], tmp_f[1]])
+                else:
+                    l_fit_res = np.polyfit(nzy[li], nzx[li], 2)
             
             ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
             if len(ri) >= self.minpts:
@@ -320,7 +357,7 @@ class CameraPerception:
 
         h, w = debug_bev.shape[:2]
 
-        # 1. 정지선 박스 그리기
+        # 1. 정지선 박스 그리기 
         if color != "NONE":
             y0 = int(self.stop_y0 * h)
             y1 = int(self.stop_y1 * h)

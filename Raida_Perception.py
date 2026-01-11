@@ -13,7 +13,7 @@ from std_msgs.msg import Float32MultiArray
 
 WIDTH, HEIGHT = 640, 480
 CENTER = (WIDTH // 2, HEIGHT - 50)
-SCALE = 80
+SCALE = 120
 
 class RaidaLanePrediction:
     """
@@ -28,7 +28,7 @@ class RaidaLanePrediction:
         self.distance_threshold = 0.1  # 같은 물체로 판단할 점들 사이의 최대 거리 (m)
         self.min_cluster_size = 3      # 유효한 물체로 볼 최소 점 개수
         self.max_cluster_size = 30     # 라바콘 크기를 고려한 최대 점 개수
-        self.roi_front_min_limit = 0.07       # 전방 최소 탐지 거리
+        self.roi_front_min_limit = 0.2       # 전방 최소 탐지 거리
         self.roi_front_max_limit = 1.3     # 전방 탐색 제한 거리 (m) 
         self.isdetected = False         # 라인 감지 확인용
 
@@ -59,8 +59,9 @@ class RaidaLanePrediction:
         center_x = -D / 2
         center_y = -E / 2
 
-        dist = center_x**2 + center_y**2
-
+        dist_left = center_x**2 + (center_y-0.3)**2
+        dist_right = center_x**2 + (center_y+0.3)**2
+        dist = dist_right if dist_left > dist_right else dist_left
         return center_x, center_y, dist
 
     # 라이다 데이터를 처리하여 클러스터링 수행
@@ -104,8 +105,8 @@ class RaidaLanePrediction:
 
         # 클러스터별 좌표 및 좌우 차선 분류
         obstacle_center_arr = []
-        left_line = []
-        right_line = []
+        left_line = [(0, 0.3)]
+        right_line = [(0, -0.3)]
 
         for cluster in clusters:
             arr = np.array(cluster)
@@ -125,18 +126,13 @@ class RaidaLanePrediction:
                     left_line.append(point)
                 else:
                     right_line.append(point)
-            else:
-                if point[1] > 0:
-                    left_line.append(point)
-                else:
-                    right_line.append(point)
 
         self.viz_cones_left = left_line
         self.viz_cones_right = right_line
 
         # 포맷: [L_a, L_b, L_c,  R_a, R_b, R_c]
-        if len(points) == 0 or len(right_line) < 3 or len(left_line) < 3: 
-            # 라바콘이 없거나 둘중 한쪽 차선의 라바콘이 2개 이하일 때, 장애물 없다고 판단.
+        if len(points) == 0 or len(right_line) < 4 or len(left_line) < 4: 
+            # 라바콘이 없거나 둘중 한쪽 차선의 라바콘이 3개 이하일 때, 장애물 없다고 판단.
             coeffs = []
             self.isdetected = False
         else:
@@ -158,7 +154,7 @@ class RaidaLanePrediction:
 
         self.viz_coeffs = coeffs
 
-        # 데이터 pub류
+        # 데이터 pub
         msg = Float32MultiArray()
         msg.data = coeffs
         self.pub_coeffs.publish(msg)
@@ -244,6 +240,8 @@ class RaidaLanePrediction:
                     pts_right.append([int(CENTER[0] - ry * SCALE), int(CENTER[1] - x * SCALE)])
                 if abs(cy) < 3.0:
                     pts_center.append([int(CENTER[0] - cy * SCALE), int(CENTER[1] - x * SCALE)])
+                    if abs(x - 0.5) < 0.001:
+                        cv2.circle(img, (int(CENTER[0] - cy * SCALE), int(CENTER[1] - x * SCALE)), 5, (0, 255, 0), 2)
 
             # 선 그리기 (Polylines)
             if len(pts_left) > 1 and (la!=0 or lb!=0):

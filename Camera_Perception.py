@@ -429,8 +429,23 @@ class CameraPerception:
         # (3) 주행 중심선 그리기 (양쪽 다 있을 때만)
         ptsC = []
         LINE_WIDTH_PX = 400
-        if lf is None: lf = (rf[0], rf[1], rf[2]-LINE_WIDTH_PX)
-        if rf is None: rf = (lf[0], lf[1], lf[2]+LINE_WIDTH_PX)
+        if lf is None or rf is None:
+            base_lane = rf if lf is None else lf
+            grad = 2*base_lane[0]*base_lane[1] + base_lane[2]
+            if grad < 0:
+                if rf is None:
+                    rf = base_lane
+                    lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
+                else:
+                    lf = base_lane
+                    rf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
+            else:
+                if lf is None:
+                    lf = base_lane
+                    rf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
+                else:
+                    rf = base_lane
+                    lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
         for y in plot_y:
             lx = self._poly_x(lf, y)
             rx = self._poly_x(rf, y)

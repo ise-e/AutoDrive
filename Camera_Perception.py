@@ -183,7 +183,7 @@ class CameraPerception:
             # 너비 변화량 (Width Deviation)
             width_deviation = abs(w_top - w_bot)
             # 차이가 60 이상일 경우 **값 조정 필요
-            if width_deviation > 60:
+            if width_deviation > 60 or w_top < 60:
                 if w_top < w_bot:  # 상단으로 갈수록 너비가 좁아지는 경우 (수렴)
                     if self.mdir == "LEFT":
                         # 왼쪽으로 가야 하는데 왼쪽이 좁아지면, 확실한 오른쪽 선을 기준으로 주행

@@ -73,7 +73,7 @@ class CameraPerception:
         # ---------- stopline ----------
         self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
         self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
-        self.stop_thr = float(get_param("~stop_px_per_col", 7.0))
+        self.stop_thr = float(get_param("~stop_px_per_col", 4.0))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
         # 정지선 검증을 위한 파라미터
@@ -245,7 +245,7 @@ class CameraPerception:
         gray_bev = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
         sobely = cv2.Sobel(gray_bev, cv2.CV_64F, 0, 1, ksize=3)
         sobely = cv2.convertScaleAbs(sobely)
-        _, stop_edge_mask = cv2.threshold(sobely, 40, 255, cv2.THRESH_BINARY)
+        _, stop_edge_mask = cv2.threshold(sobely, 35, 255, cv2.THRESH_BINARY)
 
         # 정지선 후보 영역 추출
         roi_stop_mask = lane_mask[stop_y0:stop_y1, :].copy()
@@ -259,7 +259,7 @@ class CameraPerception:
         pure_stop_candidate = cv2.bitwise_and(pure_stop_candidate, stop_edge_mask[stop_y0:stop_y1, :])
 
         # 최종 가로 필터 적용
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 1))
         final_stop_mask = cv2.morphologyEx(pure_stop_candidate, cv2.MORPH_OPEN, horiz_kernel)
 
         ypx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, ymask[stop_y0:stop_y1, :]))
@@ -449,7 +449,7 @@ class CameraPerception:
                 cx = rx - LINE_WIDTH_PX / 2
                 if 0 <= cx < w: 
                     ptsC.append((int(cx), y))
-                    
+
         if len(ptsC) >= 2:
             cv2.polylines(debug_bev, [np.array(ptsC)], False, (0, 255, 0), 2)  # 초록색
 

@@ -395,11 +395,11 @@ class DecisionNode:
             p_term = err_norm * float(self.cfg.kp * 5)
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
         elif s.lane:
-            y = (self.cfg.h - 1) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+            y = (self.cfg.h - 20) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w) * 0.5)
             err_norm = (s.lane.x_center(y) - half_w) / half_w
-            p_term = err_norm * float(self.cfg.kp)
-            d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
+            p_term = err_norm * float(self.cfg.kp * 5)
+            d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
         else:
             self.accum_error = 0.0
             self.prev_error = 0.0

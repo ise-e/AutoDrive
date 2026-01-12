@@ -328,19 +328,55 @@ class CameraPerception:
             if len(gr) > self.minpix:
                 rx = int(np.mean(nzx[gr]))
 
+        EXPECTED_L_X = int(self.w * (150/640))  # 약 150px
+        EXPECTED_R_X = int(self.w * (490/640))  # 약 490px
+        IMG_BOTTOM_Y = self.h - 1               # 479px
+
+        # 가중치 (앵커 점을 몇 개나 추가할지) - 높을수록 고정력 강함
+        # 차가 흔들릴 때 유연성을 주려면 10~20, 강력하게 고정하려면 50 이상
+        ANCHOR_WEIGHT = 30 
+
         l_fit_res, r_fit_res = None, None
+        
         try:
             li = np.concatenate(lidx) if lidx else np.array([], np.int32)
+            
+            # [왼쪽 차선 피팅]
             if len(li) >= self.minpts:
-                if len(li) < self.minpts * 1.5: 
-                    tmp_f = np.polyfit(nzy[li], nzx[li], 1)
+                # 1. 실제 검출된 점들
+                real_y = nzy[li]
+                real_x = nzx[li]
+
+                # 2. 앵커(고정) 점 생성: 맨 아래(IMG_BOTTOM_Y)에 EXPECTED_L_X 좌표를 여러 개 추가
+                anchor_y = np.full(ANCHOR_WEIGHT, IMG_BOTTOM_Y)
+                anchor_x = np.full(ANCHOR_WEIGHT, EXPECTED_L_X)
+
+                # 3. 데이터 합치기 (실제 점 + 앵커 점)
+                final_y = np.concatenate([real_y, anchor_y])
+                final_x = np.concatenate([real_x, anchor_x])
+
+                # 4. 합친 데이터로 피팅
+                if len(li) < self.minpts * 1.5:
+                    tmp_f = np.polyfit(final_y, final_x, 1)
                     l_fit_res = np.array([0.0, tmp_f[0], tmp_f[1]])
                 else:
-                    l_fit_res = np.polyfit(nzy[li], nzx[li], 2)
+                    l_fit_res = np.polyfit(final_y, final_x, 2)
             
+            # [오른쪽 차선 피팅]
             ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
             if len(ri) >= self.minpts:
-                r_fit_res = np.polyfit(nzy[ri], nzx[ri], 2)
+                real_y = nzy[ri]
+                real_x = nzx[ri]
+
+                # 앵커 추가
+                anchor_y = np.full(ANCHOR_WEIGHT, IMG_BOTTOM_Y)
+                anchor_x = np.full(ANCHOR_WEIGHT, EXPECTED_R_X)
+
+                final_y = np.concatenate([real_y, anchor_y])
+                final_x = np.concatenate([real_x, anchor_x])
+
+                r_fit_res = np.polyfit(final_y, final_x, 2)
+
         except Exception:
             pass
 

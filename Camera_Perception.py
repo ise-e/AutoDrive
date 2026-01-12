@@ -1,25 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Camera_Perception_refactored.py (기능 유지 + 직관성 개선)
-
-토픽 계약(간단 요약)
-- 입력:
-  - ~camera_topic (sensor_msgs/Image) default: /camera/image_raw
-  - /mission_direction (String) : "LEFT" | "RIGHT"
-  - /mission_status (String) : "NONE" | "STOP" | "PARKING" | ...
-
-- 출력:
-  - /lane_coeffs (Float32MultiArray) : [la, lb, lc, ra, rb, rc]
-      x_px = a*y_px^2 + b*y_px + c  (BEV 이미지 좌표계)
-  - /stop_line_status (String) : "NONE" | "WHITE" | "YELLOW"
-  - /traffic_light_status (String) : "RED" | "YELLOW" | "GREEN" | "UNKNOWN"
-  - /ar_tag_info (Float32MultiArray) : [tag_id, dist_m, ang_rad, ...]
-  - (옵션) /debug/lane_overlay/image/compressed (CompressedImage) : 오버레이 JPG
-
-핵심 개선
-- lambda setattr 제거 -> 명시적 콜백 메서드로 추적성 향상
-- gp/sp/dp 같은 축약어 제거 -> get_param, src_pts_ratio/dst_pts_ratio 등으로 명확화
+Camera_Perception_refactored.py
+- ✅ [수정] Center Path Subscriber 콜백 오류 수정 및 시각화 추가
 """
 
 from __future__ import annotations
@@ -70,15 +53,17 @@ class CameraPerception:
         self.minpix = int(get_param("~minpix", 40))
         self.minpts = int(get_param("~min_points", 220))
 
+        # [수정] center path 저장 변수
+        self.center_path_pts = []
+
         # ---------- stopline ----------
         self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
         self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
         self.stop_thr = float(get_param("~stop_px_per_col", 4.0))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
-        # 정지선 검증을 위한 파라미터
-        self.stop_line_angle_thr = float(get_param("~stop_line_angle_threshold", 20.0))  # 수평선 허용 각도
-        self.stop_line_min_length = float(get_param("~stop_line_min_length", 100.0))  # 최소 선 길이
+        self.stop_line_angle_thr = float(get_param("~stop_line_angle_threshold", 20.0))
+        self.stop_line_min_length = float(get_param("~stop_line_min_length", 100.0))
 
         # ---------- dropout hold ----------
         self.hold_sec = float(get_param("~last_fit_hold_sec", 0.5))
@@ -107,6 +92,9 @@ class CameraPerception:
         rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1)
         rospy.Subscriber("/mission_direction", String, self._on_mission_direction, queue_size=1)
         rospy.Subscriber("/mission_status", String, self._on_mission_status, queue_size=1)
+        
+        # [수정] Center Path 수신용 Subscriber 추가
+        rospy.Subscriber("/center", Float32MultiArray, self._on_center_path, queue_size=1)
 
         rospy.loginfo("[CamPerc] refactored | cam=%s overlay=%s", self.cam_topic, self.overlay_topic)
 
@@ -116,6 +104,21 @@ class CameraPerception:
 
     def _on_mission_status(self, msg: String):
         self.mstatus = (msg.data or "NONE").upper()
+
+    # [수정] Center Path 수신 콜백
+    def _on_center_path(self, msg: Float32MultiArray):
+        data = msg.data
+        if not data:
+            self.center_path_pts = []
+            return
+        
+        # Decision에서 [x, y, x, y ...] 순서의 Flat List로 옴
+        pts = []
+        for i in range(0, len(data), 2):
+            x = int(data[i])
+            y = int(data[i+1])
+            pts.append([x, y])
+        self.center_path_pts = np.array(pts, dtype=np.int32)
 
     # ---------------- helper ----------------
     @staticmethod
@@ -173,42 +176,30 @@ class CameraPerception:
 
         # 양쪽 차선 모두 검지
         if lfit is not None and rfit is not None:
-            # 이미지 최하단
             y_bot = self.h - 1
-            # 이미지 상단
             y_top = int(self.h * 0.3)
-            # 각 지점에서의 너비 계산
             w_bot = self._poly_x(rfit, y_bot) - self._poly_x(lfit, y_bot)
             w_top = self._poly_x(rfit, y_top) - self._poly_x(lfit, y_top)
-            # 너비 변화량 (Width Deviation)
             width_deviation = abs(w_top - w_bot)
-            # 차이가 60 이상일 경우 **값 조정 필요
+            
             if width_deviation > 60 or w_top < 60:
-                if w_top < w_bot:  # 상단으로 갈수록 너비가 좁아지는 경우 (수렴)
+                if w_top < w_bot:  # 수렴
                     if self.mdir == "LEFT":
-                        # 왼쪽으로 가야 하는데 왼쪽이 좁아지면, 확실한 오른쪽 선을 기준으로 주행
                         self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
-                    else: # RIGHT 미션
-                        # 오른쪽으로 가야 하는데 오른쪽이 좁아지면, 왼쪽 선을 기준으로 주행
+                    else: 
                         self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
-                else:  # 상단으로 갈수록 너비가 넓어지는 경우 (발산/갈림길)
+                else:  # 발산
                     if self.mdir == "LEFT":
-                        # 왼쪽 갈림길을 타기 위해 왼쪽 차선을 가이드로 선택
                         self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
-                    else: # RIGHT 미션
-                        # 오른쪽 갈림길을 타기 위해 오른쪽 차선을 가이드로 선택
+                    else: 
                         self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
-            # 정상적인 경우
             else :
                 self.last_fit, self.last_fit_t = (lfit, rfit), now_sec()
                 self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
-        # 왼쪽만 검지
         elif lfit is not None:
             self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
-        # 오른쪽만 검지
         elif rfit is not None:
             self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
-        # 둘 다 미검지 ** 이 부분은 나중에 판단 노드로 옮길 생각입니다
         else:
             if self.last_fit is not None and (now_sec() - self.last_fit_t) < self.hold_sec:
                 lfit_last, rfit_last = self.last_fit
@@ -228,7 +219,7 @@ class CameraPerception:
         combined_view = np.hstack([debug_frame, debug_bev])
         self._publish_overlay(combined_view)
 
-    # ---------------- algorithms (원본 로직 유지) ----------------
+    # ---------------- algorithms ----------------
     def _lane_stop(self, bev):
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
@@ -238,27 +229,21 @@ class CameraPerception:
         h, w = ymask.shape
         stop_y0, stop_y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
 
-        # 차선 피팅용 전체 마스크 생성
         lane_mask = cv2.bitwise_or(ymask, wmask)
 
-        # Sobel Y 연산, 수직 방향 그레이디언트 강조
         gray_bev = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
         sobely = cv2.Sobel(gray_bev, cv2.CV_64F, 0, 1, ksize=3)
         sobely = cv2.convertScaleAbs(sobely)
         _, stop_edge_mask = cv2.threshold(sobely, 35, 255, cv2.THRESH_BINARY)
 
-        # 정지선 후보 영역 추출
         roi_stop_mask = lane_mask[stop_y0:stop_y1, :].copy()
         
-        # 세로로 긴 커널을 사용하여 '차선'인 부분을 찾고, 이를 정지선 후보에서 뺍니다.
         vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
         lane_only_part = cv2.morphologyEx(roi_stop_mask, cv2.MORPH_OPEN, vert_kernel)
         
-        # 정지선 후보 = (원본 마스크 - 세로 성분) & SobelY 가로 엣지
         pure_stop_candidate = cv2.subtract(roi_stop_mask, lane_only_part)
         pure_stop_candidate = cv2.bitwise_and(pure_stop_candidate, stop_edge_mask[stop_y0:stop_y1, :])
 
-        # 최종 가로 필터 적용
         horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 1))
         final_stop_mask = cv2.morphologyEx(pure_stop_candidate, cv2.MORPH_OPEN, horiz_kernel)
 
@@ -328,12 +313,10 @@ class CameraPerception:
             if len(gr) > self.minpix:
                 rx = int(np.mean(nzx[gr]))
 
-        EXPECTED_L_X = int(self.w * (150/640))  # 약 150px
-        EXPECTED_R_X = int(self.w * (490/640))  # 약 490px
-        IMG_BOTTOM_Y = self.h - 1               # 479px
+        EXPECTED_L_X = int(self.w * (150/640))
+        EXPECTED_R_X = int(self.w * (490/640))
+        IMG_BOTTOM_Y = self.h - 1
 
-        # 가중치 (앵커 점을 몇 개나 추가할지) - 높을수록 고정력 강함
-        # 차가 흔들릴 때 유연성을 주려면 10~20, 강력하게 고정하려면 50 이상
         ANCHOR_WEIGHT = 30 
 
         l_fit_res, r_fit_res = None, None
@@ -341,34 +324,27 @@ class CameraPerception:
         try:
             li = np.concatenate(lidx) if lidx else np.array([], np.int32)
             
-            # [왼쪽 차선 피팅]
             if len(li) >= self.minpts:
-                # 1. 실제 검출된 점들
                 real_y = nzy[li]
                 real_x = nzx[li]
 
-                # 2. 앵커(고정) 점 생성: 맨 아래(IMG_BOTTOM_Y)에 EXPECTED_L_X 좌표를 여러 개 추가
                 anchor_y = np.full(ANCHOR_WEIGHT, IMG_BOTTOM_Y)
                 anchor_x = np.full(ANCHOR_WEIGHT, EXPECTED_L_X)
 
-                # 3. 데이터 합치기 (실제 점 + 앵커 점)
                 final_y = np.concatenate([real_y, anchor_y])
                 final_x = np.concatenate([real_x, anchor_x])
 
-                # 4. 합친 데이터로 피팅
                 if len(li) < self.minpts * 1.5:
                     tmp_f = np.polyfit(final_y, final_x, 1)
                     l_fit_res = np.array([0.0, tmp_f[0], tmp_f[1]])
                 else:
                     l_fit_res = np.polyfit(final_y, final_x, 2)
             
-            # [오른쪽 차선 피팅]
             ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
             if len(ri) >= self.minpts:
                 real_y = nzy[ri]
                 real_x = nzx[ri]
 
-                # 앵커 추가
                 anchor_y = np.full(ANCHOR_WEIGHT, IMG_BOTTOM_Y)
                 anchor_x = np.full(ANCHOR_WEIGHT, EXPECTED_R_X)
 
@@ -388,12 +364,10 @@ class CameraPerception:
 
     def _debug_line(self, bev, lane, lf, rf, stop, ypx, wpx, color):
         debug_bev = bev.copy()
-        # 차선 마스크(흰/노랑)를 초록 채널에 섞어서 표시
         debug_bev[:, :, 1] = np.maximum(debug_bev[:, :, 1], (lane // 2).astype(np.uint8))
 
         h, w = debug_bev.shape[:2]
 
-        # 1. 정지선 박스 그리기 
         if color != "NONE":
             y0 = int(self.stop_y0 * h)
             y1 = int(self.stop_y1 * h)
@@ -402,58 +376,31 @@ class CameraPerception:
             cv2.putText(debug_bev, f"{stop} LINE", (w // 2 - 100, y0 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, box_color, 2)
 
-        # 2. 차선 시각화 (각각 독립적으로 수행)
         ptsL, ptsR = [], []
-        
-        # Y좌표 생성 (이미지 하단 -> 상단)
         plot_y = np.linspace(h - 1, 0, h // 20).astype(int)
 
-        # (1) 왼쪽 차선 그리기
         if lf is not None:
             for y in plot_y:
                 lx = self._poly_x(lf, y)
                 if 0 <= lx < w:
                     ptsL.append((int(lx), y))
             if len(ptsL) >= 2:
-                cv2.polylines(debug_bev, [np.array(ptsL)], False, (255, 0, 0), 2)  # 파란색
+                cv2.polylines(debug_bev, [np.array(ptsL)], False, (255, 0, 0), 2)
 
-        # (2) 오른쪽 차선 그리기
         if rf is not None:
             for y in plot_y:
                 rx = self._poly_x(rf, y)
                 if 0 <= rx < w:
                     ptsR.append((int(rx), y))
             if len(ptsR) >= 2:
-                cv2.polylines(debug_bev, [np.array(ptsR)], False, (0, 0, 255), 2)  # 빨간색
+                cv2.polylines(debug_bev, [np.array(ptsR)], False, (0, 0, 255), 2)
 
-        # (3) 주행 중심선 그리기 (양쪽 다 있을 때만)
-        ptsC = []
-        LINE_WIDTH_PX = 400
-        if lf is not None and rf is not None:
-            for y in plot_y:
-                lx = self._poly_x(lf, y)
-                rx = self._poly_x(rf, y)
-                if 0 <= lx < w and 0 <= rx < w:
-                    cx = (lx + rx) * 0.5
-                    ptsC.append((int(cx), y))
-        elif lf is not None:
-            for y in plot_y:
-                lx = self._poly_x(lf, y)
-                cx = lx + LINE_WIDTH_PX / 2
-                if 0 <= cx < w: 
-                    ptsC.append((int(cx), y))
+        # [수정] Center Path 시각화 (초록색 선)
+        if len(self.center_path_pts) >= 2:
+            cv2.polylines(debug_bev, [self.center_path_pts], False, (0, 255, 0), 2)
+        pts = np.array([(479, 320), (360, 320)], dtype=np.int32)
+        cv2.polylines(debug_bev, [pts], False, (255, 255, 0), 2)
 
-        elif rf is not None:
-            for y in plot_y:
-                rx = self._poly_x(rf, y)
-                cx = rx - LINE_WIDTH_PX / 2
-                if 0 <= cx < w: 
-                    ptsC.append((int(cx), y))
-
-        if len(ptsC) >= 2:
-            cv2.polylines(debug_bev, [np.array(ptsC)], False, (0, 255, 0), 2)  # 초록색
-
-        # 3. 상태 텍스트
         detect_status = []
         if lf is not None: detect_status.append("L")
         if rf is not None: detect_status.append("R")
@@ -466,7 +413,6 @@ class CameraPerception:
         
         return debug_bev
 
-    # 신호등 탐지 시각화 함수
     def _debug_light(self, debug_frame, min_h, max_h, min_w, max_w, light):
         color = (0, 0, 0)
         if light == "GREEN":
@@ -488,7 +434,6 @@ class CameraPerception:
         light_result = best if max(red, yel, grn) > 200 else "UNKNOWN"
         self.pub_tl.publish(light_result)
 
-        # ==============DEBUG==============
         if light_result != "UNKNOWN":
             self._debug_light(debug_frame, 0, int(h * 0.4), int(w * 0.2), int(w * 0.8), light_result)
         return debug_frame
@@ -505,7 +450,7 @@ class CameraPerception:
         if ids is None:
             return
 
-        cv2.aruco.drawDetectedMarkers(debug_frame, corners, ids, (255, 0, 0)) # 시각화 코드
+        cv2.aruco.drawDetectedMarkers(debug_frame, corners, ids, (255, 0, 0))
 
         tag = float(rospy.get_param("~tag_size", 0.15))
         focal = float(rospy.get_param("~focal_length", 600.0))

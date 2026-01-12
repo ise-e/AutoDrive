@@ -1,518 +1,475 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-DecisionNode
-- 개선된 I/O / PF 블렌드 / Lane RViz marker 구조는 유지
-- 상태머신만 "기존 대회 시나리오 FSM"으로 사용
-- ✅ FSM 로그 추가:
-  1) 상태 전이 로그: 전이 발생 시 1회 출력
-  2) 상태 유지 로그: 1Hz throttle로 현재 입력/출력/명령 출력
+Camera_Perception_refactored.py
+- ✅ [수정] Center Path Subscriber 콜백 오류 수정 및 시각화 추가
 """
 
 from __future__ import annotations
 
-import math
-import threading
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, List
-
+import time
 import rospy
-from std_msgs.msg import Int16MultiArray, String, Float32MultiArray, Float32
-from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
+import cv2
+import numpy as np
+
+from sensor_msgs.msg import Image, CompressedImage
+from std_msgs.msg import Float32MultiArray, String
 
 
-# ---------------- Data Structures ----------------
-@dataclass
-class Lane:
-    """차선 다항식 계수: [la, lb, lc, ra, rb, rc]"""
-    c: List[float]
-
-    def x_center(self, y: float) -> float:
-        la, lb, lc, ra, rb, rc = self.c
-        lx = la * y * y + lb * y + lc
-        rx = ra * y * y + rb * y + rc
-        return 0.5 * (lx + rx)
-
-    def x_poly(self, y: float, is_left: bool) -> float:
-        base = 0 if is_left else 3
-        return self.c[base] * y * y + self.c[base + 1] * y + self.c[base + 2]
+def now_sec() -> float:
+    return time.time()
 
 
-@dataclass
-class Snap:
-    """루프 1회에서 사용하는 입력 스냅샷(원자적 캡처)"""
-    t: float
-    lane: Optional[Lane]
-    obs_lane: Optional[Lane]
-    stop: str
-    light: str
-    ar: Optional[Tuple[float, float]]   # (dist_m, ang_rad)
-
-@dataclass
-class FsmOut:
-    """FSM 출력(카메라 노드와의 계약)"""
-    mission_direction: str   # "RIGHT" | "LEFT"
-    mission_status: str      # "NONE" | "STOP" | "PARKING" | "FINISH"
-
-
-# ---------------- 기존 시나리오 FSM ----------------
-class LegacyScenarioFSM:
-    """
-    "기존 Decision(대회 시나리오) 상태머신" 구현 + 로그 포함
-
-    시나리오 요약:
-    - START -> YELLOW_STOP_1 -> DRIVE_RIGHT -> DRIVE_LEFT -> YELLOW_STOP_2 -> PARKING -> FINISH
-    - WHITE 2회 카운트 -> mission_direction = LEFT
-    - 1차 YELLOW: STOP 유지, GREEN이면 DRIVE_RIGHT로 전환
-    - 2차 YELLOW: STOP 유지, GREEN이면 PARKING으로 전환
-    - PARKING: AR dist <= park_stop_dist_m 이면 FINISH
-    """
-
-    START = "START"
-    YELLOW_STOP_1 = "YELLOW_STOP_1"
-    DRIVE_RIGHT = "DRIVE_RIGHT"
-    DRIVE_LEFT = "DRIVE_LEFT"
-    YELLOW_STOP_2 = "YELLOW_STOP_2"
-    PARKING = "PARKING"
-    FINISH = "FINISH"
-
-    def __init__(self, stopline_debounce_sec: float, park_stop_dist_m: float):
-        self.state = self.START
-
-        self.stopline_debounce_sec = float(stopline_debounce_sec)
-        self.park_stop_dist_m = float(park_stop_dist_m)
-
-        self.white_count = 0
-        self.mission_direction = "RIGHT"
-
-        self._ts_white = 0.0
-        self._ts_yellow = 0.0
-
-        self._state_name = {
-            self.START: "START",
-            self.YELLOW_STOP_1: "YELLOW_STOP_1",
-            self.DRIVE_RIGHT: "DRIVE_RIGHT",
-            self.DRIVE_LEFT: "DRIVE_LEFT",
-            self.YELLOW_STOP_2: "YELLOW_STOP_2",
-            self.PARKING: "PARKING",
-            self.FINISH: "FINISH",
-        }
-
-    def _debounced(self, now_t: float, last_t: float) -> bool:
-        return (now_t - last_t) >= self.stopline_debounce_sec
-
-    def _log_transition(self, prev_state: str, new_state: str, s: Snap, out: FsmOut) -> None:
-        rospy.loginfo(
-            "[FSM] %s -> %s | stop=%s light=%s white=%d ar=%s | dir=%s status=%s",
-            self._state_name.get(prev_state, prev_state),
-            self._state_name.get(new_state, new_state),
-            (s.stop or "NONE"),
-            (s.light or "UNKNOWN"),
-            self.white_count,
-            ("None" if s.ar is None else f"{s.ar[0]:.2f}m,{math.degrees(s.ar[1]):.1f}deg"),
-            out.mission_direction,
-            out.mission_status,
-        )
-
-    def step(self, s: Snap) -> FsmOut:
-        prev_state = self.state
-
-        stop = (s.stop or "NONE").upper()
-        light = (s.light or "UNKNOWN").upper()
-
-        # --- WHITE 카운트(디바운스) ---
-        if stop == "WHITE" and self._debounced(s.t, self._ts_white):
-            self._ts_white = s.t
-            self.white_count += 1
-            rospy.loginfo("[FSM] WHITE++ -> %d", self.white_count)
-            if self.white_count >= 2:
-                self.mission_direction = "LEFT"
-
-        # --- 상태 전이 ---
-        if self.state == self.START:
-            # 시작 직후 1차 노란선 정지 상태로 진입
-            self.state = self.YELLOW_STOP_1
-            out = FsmOut(self.mission_direction, "NONE")
-            if prev_state != self.state:
-                self._log_transition(prev_state, self.state, s, out)
-            return out
-
-        if self.state == self.YELLOW_STOP_1:
-            # 노란선 감지: STOP, GREEN이면 출발
-            if stop == "YELLOW" and self._debounced(s.t, self._ts_yellow):
-                self._ts_yellow = s.t
-                return FsmOut(self.mission_direction, "STOP")
-
-            if stop == "YELLOW":
-                if light == "GREEN":
-                    self.state = self.DRIVE_RIGHT
-                    out = FsmOut(self.mission_direction, "NONE")
-                    if prev_state != self.state:
-                        self._log_transition(prev_state, self.state, s, out)
-                    return out
-                return FsmOut(self.mission_direction, "STOP")
-
-            return FsmOut(self.mission_direction, "NONE")
-
-        if self.state == self.DRIVE_RIGHT:
-            # WHITE 2회면 LEFT 주행으로
-            if self.white_count >= 2:
-                self.state = self.DRIVE_LEFT
-                out = FsmOut(self.mission_direction, "NONE")
-                if prev_state != self.state:
-                    self._log_transition(prev_state, self.state, s, out)
-                return out
-            return FsmOut(self.mission_direction, "NONE")
-
-        if self.state == self.DRIVE_LEFT:
-            # 2차 노란선 만나면 STOP2 진입
-            if stop == "YELLOW" and self._debounced(s.t, self._ts_yellow):
-                self._ts_yellow = s.t
-                self.state = self.YELLOW_STOP_2
-                out = FsmOut(self.mission_direction, "STOP")
-                if prev_state != self.state:
-                    self._log_transition(prev_state, self.state, s, out)
-                return out
-            return FsmOut(self.mission_direction, "NONE")
-
-        if self.state == self.YELLOW_STOP_2:
-            # 노란선 위에서는 STOP, GREEN이면 PARKING
-            if stop == "YELLOW":
-                if light == "GREEN":
-                    self.state = self.PARKING
-                    out = FsmOut(self.mission_direction, "PARKING")
-                    if prev_state != self.state:
-                        self._log_transition(prev_state, self.state, s, out)
-                    return out
-                return FsmOut(self.mission_direction, "STOP")
-
-            # 노란선이 안 보이면 일단 NONE
-            return FsmOut(self.mission_direction, "NONE")
-
-        if self.state == self.PARKING:
-            # AR로 접근해서 dist <= park_stop_dist_m면 FINISH
-            if s.ar is not None:
-                dist_m = float(s.ar[0])
-                if dist_m <= self.park_stop_dist_m:
-                    self.state = self.FINISH
-                    out = FsmOut(self.mission_direction, "FINISH")
-                    if prev_state != self.state:
-                        self._log_transition(prev_state, self.state, s, out)
-                    return out
-            return FsmOut(self.mission_direction, "PARKING")
-
-        # FINISH
-        return FsmOut(self.mission_direction, "FINISH")
-
-
-# ---------------- Decision Node ----------------
-class DecisionNode:
+class CameraPerception:
     def __init__(self):
-        rospy.init_node("decision_node")
+        rospy.init_node("camera_perception_node")
+        get_param = rospy.get_param
 
-        gp = lambda n, d: rospy.get_param("~" + n, d)
+        # ---------- IO ----------
+        self.cam_topic = get_param("~camera_topic", "/camera/image_raw")
+        self.w, self.h = int(get_param("~out_w", 640)), int(get_param("~out_h", 480))
 
-        self.accum_error = 0
-        self.prev_error = 0
-        self.prev_steer = None
-        
-        # --- config ---
-        self.cfg = type("Cfg", (), {
-            # steering / speed
-            "cen": int(gp("steer_center", 90)),
-            "min": int(gp("steer_min", 45)),
-            "max": int(gp("steer_max", 135)),
-            "kp": float(gp("kp_steer", 45.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
-            "kd": float(gp("kd_steer", 15)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
-            "ki": float(gp("ki_steer", 0.0001)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
-            "spd_drive": int(gp("speed_drive", 100)),
-            "spd_stop": int(gp("speed_stop", 90)),
-            "spd_parking": int(gp("speed_parking", 99)),
+        self.overlay_topic = get_param("~overlay_topic", "/debug/lane_overlay/image/compressed")
+        self.overlay_on = bool(get_param("~overlay_enable", True))
+        self.jpg_q = int(get_param("~jpeg_quality", 80))
 
-            # run-speed floor (90~97은 정지로 해석되는 플랫폼 대응)
-            "speed_min_run": int(gp("speed_min_run", 99)),
-
-            # BEV geometry
-            "w": int(gp("bev_w", 640)),
-            "h": int(gp("bev_h", 480)),
-
-            # stopline / parking
-            "t_db": float(gp("stopline_debounce_sec", 1.0)),
-            "dist_p": float(gp("park_stop_dist_m", 0.3)),
-
-            # lane eval
-            "lane_eval_y": float(gp("lane_eval_y", -1.0)),
-            "obs_eval_x": float(gp("obs_eval_x", 0.5)),
-
-            # parking search (AR 없을 때)
-            "park_search_sec": float(gp("park_search_sec", 1.0)),
-            "park_search_speed": int(gp("park_search_speed", 98)),
-
-            # viz
-            "base_frame": str(gp("base_frame", "base_link")),
-            "meters_per_pixel_x": float(gp("meters_per_pixel_x", 0.01)),
-            "meters_per_pixel_y": float(gp("meters_per_pixel_y", 0.01)),
-            "lane_marker_enable": bool(gp("lane_marker_enable", True)),
-            "lane_marker_topic": str(gp("lane_marker_topic", "/viz/lanes")),
-            "lane_marker_width": float(gp("lane_marker_width", 0.02)),
-            "lane_marker_lifetime": float(gp("lane_marker_lifetime", 0.2)),
-            "lane_sample_step_px": int(gp("lane_sample_step_px", 40)),
-        })()
-
-        # --- FSM ---
-        self.fsm = LegacyScenarioFSM(
-            stopline_debounce_sec=self.cfg.t_db,
-            park_stop_dist_m=self.cfg.dist_p
+        # ---------- BEV ----------
+        src_pts_ratio = get_param(
+            "~src_pts_ratio",
+            [200/640, 300/480, 440/640, 300/480, 50/640, 450/480, 590/640, 450/480]
+        )
+        dst_pts_ratio = get_param(
+            "~dst_pts_ratio",
+            [150/640, 0/480, 490/640, 0/480, 150/640, 1.0, 490/640, 1.0]
+        )
+        self.M = cv2.getPerspectiveTransform(
+            self._ratio_pts(src_pts_ratio, self.w, self.h),
+            self._ratio_pts(dst_pts_ratio, self.w, self.h),
         )
 
-        # --- input cache ---
-        self.lock = threading.RLock()
-        self._d: Dict[str, Any] = {
-            "lane": None,
-            "obs_lane": None,
-            "stop": "NONE",
-            "light": "UNKNOWN",
-            "ar": None,
-        }
+        # ---------- lane fit ----------
+        self.nw = int(get_param("~nwindows", 9))
+        self.margin = int(get_param("~margin", 60))
+        self.minpix = int(get_param("~minpix", 40))
+        self.minpts = int(get_param("~min_points", 220))
 
-        # --- publishers ---
-        self.pub_motor = rospy.Publisher("/motor", Int16MultiArray, queue_size=1)
-        self.pub_dir = rospy.Publisher("/mission_direction", String, queue_size=1)
-        self.pub_status = rospy.Publisher("/mission_status", String, queue_size=1)
+        # [수정] center path 저장 변수
+        self.center_path_pts = []
 
-        self.pub_viz = None
-        if self.cfg.lane_marker_enable and self.cfg.lane_marker_topic:
-            self.pub_viz = rospy.Publisher(self.cfg.lane_marker_topic, MarkerArray, queue_size=1)
+        # ---------- stopline ----------
+        self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
+        self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
+        self.stop_thr = float(get_param("~stop_px_per_col", 4.0))
+        self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
-        # --- subscribers ---
-        rospy.Subscriber("/lane_coeffs", Float32MultiArray, self._cb_lane, queue_size=1)
-        rospy.Subscriber("/obs_lane_coeffs", Float32MultiArray, self._cb_obs_lane, queue_size=1)
-        rospy.Subscriber("/stop_line_status", String, lambda m: self._up("stop", (m.data or "NONE").upper()), queue_size=1)
-        rospy.Subscriber("/traffic_light_status", String, lambda m: self._up("light", (m.data or "UNKNOWN").upper()), queue_size=1)
-        rospy.Subscriber("/ar_tag_info", Float32MultiArray, self._cb_ar, queue_size=1)
+        self.stop_line_angle_thr = float(get_param("~stop_line_angle_threshold", 20.0))
+        self.stop_line_min_length = float(get_param("~stop_line_min_length", 100.0))
 
-        self._ts_ar_missing = 0.0
+        # ---------- dropout hold ----------
+        self.hold_sec = float(get_param("~last_fit_hold_sec", 0.5))
+        self.last_fit = None
+        self.last_fit_t = 0.0
 
-        rospy.loginfo("[Decision] Legacy FSM + FSM logs enabled.")
+        # ---------- mission state ----------
+        self.mdir = "RIGHT"
+        self.mstatus = "NONE"
 
-    # ---------------- Cache update ----------------
-    def _up(self, key: str, val: Any, tkey: Optional[str] = None) -> None:
-        now = rospy.get_time()
-        with self.lock:
-            self._d[key] = val
-            if tkey:
-                self._d[tkey] = now
+        # ---------- HSV ranges ----------
+        self.RED1 = (np.array([0, 100, 100]),   np.array([10, 255, 255]))
+        self.RED2 = (np.array([160, 100, 100]), np.array([179, 255, 255]))
+        self.YELLOW = (np.array([15, 100, 100]), np.array([35, 255, 255]))
+        self.GREEN  = (np.array([45, 100, 100]), np.array([90, 255, 255]))
+        self.WHITE  = (np.array([0, 0, 200]),    np.array([179, 40, 255]))
 
-    def _cb_lane(self, m: Float32MultiArray) -> None:
-        data = list(m.data) if m.data else []
-        n = len(data)
-        y_eval = 100
-        LINE_WIDTH_PX = 400  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
-        if n >= 6:
-            # 양쪽 차선 정상 수신
-            lane = Lane(data)
-        elif n >= 3:
-            # 한쪽 차선만 수신 (a, b, c 추출)
-            a, b, c = data[0], data[1], data[2]
-            grad = 2*a*y_eval + b
-            if grad < 0: # 감지된 것이 오른쪽 차선일 때
-                lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
-            else: # 감지된 것이 왼쪽 차선일 때
-                lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])
-        else:
-            lane = None
-        self._up("lane", lane)
+        # ---------- pubs ----------
+        self.pub_lane = rospy.Publisher("/lane_coeffs", Float32MultiArray, queue_size=1)
+        self.pub_stop = rospy.Publisher("/stop_line_status", String, queue_size=1)
+        self.pub_tl   = rospy.Publisher("/traffic_light_status", String, queue_size=1)
+        self.pub_ar   = rospy.Publisher("/ar_tag_info", Float32MultiArray, queue_size=1)
+        self.pub_ov   = rospy.Publisher(self.overlay_topic, CompressedImage, queue_size=1)
 
-    def _cb_obs_lane(self, m: Float32MultiArray) -> None:
-        data = list(m.data) if len(m.data) else []
-        if len(data):
-            obs_lane = Lane(data)
-        else:
-            obs_lane = None
-        self._up("obs_lane", obs_lane)
+        # ---------- subs ----------
+        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1)
+        rospy.Subscriber("/mission_direction", String, self._on_mission_direction, queue_size=1)
+        rospy.Subscriber("/mission_status", String, self._on_mission_status, queue_size=1)
+        
+        # [수정] Center Path 수신용 Subscriber 추가
+        rospy.Subscriber("/center", Float32MultiArray, self._on_center_path, queue_size=1)
 
-    def _cb_ar(self, m: Float32MultiArray) -> None:
-        # format: [id, dist, ang(rad)]
-        ar = (float(m.data[1]), float(m.data[2])) if (m.data and len(m.data) >= 3) else None
-        self._up("ar", (ar[0], ar[1]) if ar else None)
+        rospy.loginfo("[CamPerc] refactored | cam=%s overlay=%s", self.cam_topic, self.overlay_topic)
 
-    def _capture(self) -> Snap:
-        t = rospy.get_time()
-        with self.lock:
-            return Snap(
-                t=t,
-                lane=self._d["lane"],
-                obs_lane=self._d["obs_lane"],
-                stop=self._d["stop"],
-                light=self._d["light"],
-                ar=self._d["ar"],
-            )
+    # ---------------- mission callbacks ----------------
+    def _on_mission_direction(self, msg: String):
+        self.mdir = (msg.data or "RIGHT").upper()
 
-    # ---------------- Main loop ----------------
-    def run(self) -> None:
-        rate = rospy.Rate(30)
-        while not rospy.is_shutdown():
-            s = self._capture()
+    def _on_mission_status(self, msg: String):
+        self.mstatus = (msg.data or "NONE").upper()
 
-            f = self.fsm.step(s)
+    # [수정] Center Path 수신 콜백
+    def _on_center_path(self, msg: Float32MultiArray):
+        data = msg.data
+        if not data:
+            self.center_path_pts = []
+            return
+        
+        # Decision에서 [x, y, x, y ...] 순서의 Flat List로 옴
+        pts = []
+        for i in range(0, len(data), 2):
+            x = int(data[i])
+            y = int(data[i+1])
+            pts.append([x, y])
+        self.center_path_pts = np.array(pts, dtype=np.int32)
 
-            # compute cmd
-            if f.mission_status == "PARKING":
-                steer, speed = self._parking_cmd(s)
-            elif f.mission_status in ("STOP", "FINISH"):
-                steer, speed = self.cfg.cen, self.cfg.spd_stop
-            else:
-                steer, speed = self._drive_cmd(s)
+    # ---------------- helper ----------------
+    @staticmethod
+    def _ratio_pts(r, w, h):
+        r = [float(x) for x in r]
+        r = (r + r[:8])[:8]
+        return np.float32([
+            [r[0] * w, r[1] * h],
+            [r[2] * w, r[3] * h],
+            [r[4] * w, r[5] * h],
+            [r[6] * w, r[7] * h],
+        ])
 
-            # ✅ 상태 유지 로그 (1Hz)
-            rospy.loginfo_throttle(
-                1.0,
-                "[FSM] state=%s white=%d stop=%s light=%s ar=%s | dir=%s status=%s | cmd=(%d,%d)",
-                self.fsm.state,
-                self.fsm.white_count,
-                (s.stop or "NONE"),
-                (s.light or "UNKNOWN"),
-                ("None" if s.ar is None else f"{s.ar[0]:.2f}m,{math.degrees(s.ar[1]):.1f}deg"),
-                f.mission_direction,
-                f.mission_status,
-                int(steer), int(speed),
-            )
+    @staticmethod
+    def _rosimg_to_bgr(msg: Image):
+        if msg.height <= 0 or msg.width <= 0:
+            return None
+        enc = (msg.encoding or "").lower()
+        buf = np.frombuffer(msg.data, np.uint8)
 
-            self._publish(steer, speed, s, f)
-            rate.sleep()
+        if enc in ("bgr8", "rgb8"):
+            img = buf.reshape((msg.height, msg.width, 3))
+            return img if enc == "bgr8" else cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # ---------------- Command computation ----------------
-    def _drive_cmd(self, s: Snap) -> Tuple[int, int]:
-        steer = int(self.cfg.cen)
-        speed = int(self.cfg.spd_drive)
+        if enc in ("mono8", "8uc1"):
+            g = buf.reshape((msg.height, msg.width))
+            return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
-        # 1) Lane -> steer
-        if s.obs_lane:
-            speed = 98
-            err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
-            p_term = err_norm * float(self.cfg.kp * 5)
-            d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
-        elif s.lane:
-            y = (self.cfg.h - 20) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
-            half_w = max(1.0, float(self.cfg.w) * 0.5)
-            err_norm = (s.lane.x_center(y) - half_w) / half_w
-            p_term = err_norm * float(self.cfg.kp * 5)
-            d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
-        else:
-            self.accum_error = 0.0
-            self.prev_error = 0.0
-            return int(self.cfg.cen), max(int(speed), int(self.cfg.speed_min_run))
+        return None
 
-        self.accum_error += err_norm
-        i_term = self.accum_error * float(self.cfg.ki)
-        steer = self.cfg.cen - int(p_term + d_term + i_term)
-        self.prev_error = err_norm
-        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
-
-        target_steer = self.cfg.cen - int(p_term + d_term + i_term)
-
-        if self.prev_steer:
-            alpha = 0.0  ## 현재 kd와 기능이 겹쳐 비활성화, 추후 제거
-            steer = int(alpha * self.prev_steer + (1 - alpha) * target_steer)
-
-        self.prev_steer = steer
-        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
-
-        # 90~97은 정지로 해석되는 경우가 있어, 주행 중에는 최소 속도를 보장
-        speed = max(int(speed), int(self.cfg.speed_min_run))
-        return int(steer), int(speed)
-
-    def _parking_cmd(self, s: Snap) -> Tuple[int, int]:
-        # AR 없으면 잠깐 천천히 탐색 -> 그래도 없으면 정지
-        if s.ar is None:
-            if self._ts_ar_missing <= 0.0:
-                self._ts_ar_missing = s.t
-            if (s.t - self._ts_ar_missing) <= float(self.cfg.park_search_sec):
-                return int(self.cfg.cen), max(int(self.cfg.speed_min_run), int(self.cfg.park_search_speed))
-            return int(self.cfg.cen), int(self.cfg.spd_stop)
-
-        self._ts_ar_missing = 0.0
-        dist_m, ang_rad = float(s.ar[0]), float(s.ar[1])
-
-        if dist_m <= float(self.cfg.dist_p):
-            return int(self.cfg.cen), int(self.cfg.spd_stop)
-
-        steer = int(self.cfg.cen + int(math.degrees(ang_rad)))
-        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
-        return int(steer), max(int(self.cfg.speed_min_run), int(self.cfg.spd_parking))
-
-    # ---------------- Publish ----------------
-    def _publish(self, steer: int, speed: int, s: Snap, f: FsmOut) -> None:
-        steer = self._clamp_i(int(steer), self.cfg.min, self.cfg.max)
-        speed = int(speed)
-
-        # motor
-        self.pub_motor.publish(Int16MultiArray(data=[steer, speed]))
-
-        # mission topics (Camera_Perception 연동)
-        self.pub_dir.publish(f.mission_direction)
-        # FINISH는 외부에서 STOP처럼 다루는 경우가 많아 STOP으로 내보냄
-        self.pub_status.publish("STOP" if f.mission_status == "FINISH" else f.mission_status)
-
-        # viz
-        if self.pub_viz and s.lane:
-            try:
-                self._viz_lane(s.lane)
-            except Exception as e:
-                rospy.logwarn_throttle(1.0, f"[Decision] lane marker publish failed: {e}")
-
-    # ---------------- Viz ----------------
-    def _px_to_base(self, x_px: float, y_px: float) -> Tuple[float, float]:
-        cx = float(self.cfg.w) * 0.5
-        forward_m = (float(self.cfg.h) - float(y_px)) * float(self.cfg.meters_per_pixel_y)
-        left_m = -(float(x_px) - cx) * float(self.cfg.meters_per_pixel_x)
-        return float(forward_m), float(left_m)
-
-    def _line_marker(self, ns: str, mid: int, pts_xy, rgb) -> Marker:
-        m = Marker()
+    def _publish_overlay(self, bgr):
+        if not self.overlay_on:
+            return
+        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpg_q])
+        if not ok:
+            return
+        m = CompressedImage()
         m.header.stamp = rospy.Time.now()
-        m.header.frame_id = self.cfg.base_frame
-        m.ns, m.id = ns, int(mid)
-        m.type, m.action = Marker.LINE_STRIP, Marker.ADD
-        m.pose.orientation.w = 1.0
-        m.scale.x = float(self.cfg.lane_marker_width)
-        m.color.r, m.color.g, m.color.b, m.color.a = float(rgb[0]), float(rgb[1]), float(rgb[2]), 0.9
-        m.lifetime = rospy.Duration(float(self.cfg.lane_marker_lifetime))
-        for x, y in pts_xy:
-            m.points.append(Point(x=float(x), y=float(y), z=0.05))
-        return m
+        m.format = "jpeg"
+        m.data = enc.tobytes()
+        self.pub_ov.publish(m)
 
-    def _viz_lane(self, lane: Lane) -> None:
-        step = max(1, int(self.cfg.lane_sample_step_px))
-        left_pts, right_pts, center_pts = [], [], []
-
-        for y in range(int(self.cfg.h) - 1, -1, -step):
-            y_f = float(y)
-            lx = lane.x_poly(y_f, True)
-            rx = lane.x_poly(y_f, False)
-            cx = 0.5 * (lx + rx)
-            left_pts.append(self._px_to_base(lx, y_f))
-            right_pts.append(self._px_to_base(rx, y_f))
-            center_pts.append(self._px_to_base(cx, y_f))
-
-        if len(center_pts) < 2:
+    # ---------------- main callback ----------------
+    def _on_img(self, msg: Image):
+        frame = self._rosimg_to_bgr(msg)
+        if frame is None:
             return
 
-        ma = MarkerArray()
-        ma.markers = [
-            self._line_marker("lane_left", 0, left_pts, (0.2, 0.6, 1.0)),
-            self._line_marker("lane_right", 1, right_pts, (1.0, 0.6, 0.2)),
-            self._line_marker("lane_center", 2, center_pts, (0.3, 1.0, 0.3)),
-        ]
-        self.pub_viz.publish(ma)
+        frame = cv2.resize(frame, (self.w, self.h))
+        debug_frame = frame.copy()
+        bev = cv2.warpPerspective(frame, self.M, (self.w, self.h))
 
-    # ---------------- utils ----------------
+        lfit, rfit, stop, debug_bev = self._lane_stop(bev)
+        self.pub_stop.publish(stop)
+
+        # 양쪽 차선 모두 검지
+        if lfit is not None and rfit is not None:
+            y_bot = self.h - 1
+            y_top = int(self.h * 0.3)
+            w_bot = self._poly_x(rfit, y_bot) - self._poly_x(lfit, y_bot)
+            w_top = self._poly_x(rfit, y_top) - self._poly_x(lfit, y_top)
+            width_deviation = abs(w_top - w_bot)
+            
+            if width_deviation > 60 or w_top < 60:
+                if w_top < w_bot:  # 수렴
+                    if self.mdir == "LEFT":
+                        self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+                    else: 
+                        self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+                else:  # 발산
+                    if self.mdir == "LEFT":
+                        self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+                    else: 
+                        self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+            else :
+                self.last_fit, self.last_fit_t = (lfit, rfit), now_sec()
+                self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
+        elif lfit is not None:
+            self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+        elif rfit is not None:
+            self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+        else:
+            if self.last_fit is not None and (now_sec() - self.last_fit_t) < self.hold_sec:
+                lfit_last, rfit_last = self.last_fit
+                self.pub_lane.publish(Float32MultiArray(data=list(lfit_last) + list(rfit_last)))
+            else:
+                self.pub_lane.publish(Float32MultiArray(data=[]))
+            
+
+        if self.mstatus == "STOP":
+            debug_frame = self._traffic_light(frame, debug_frame)
+            
+        if self.mstatus == "PARKING":
+            res = self._ar_tag(frame, debug_frame)
+            if res is not None:
+                debug_frame = res
+
+        combined_view = np.hstack([debug_frame, debug_bev])
+        self._publish_overlay(combined_view)
+
+    # ---------------- algorithms ----------------
+    def _lane_stop(self, bev):
+        hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
+
+        ymask = cv2.inRange(hsv, *self.YELLOW)
+        wmask = cv2.inRange(hsv, *self.WHITE)
+
+        h, w = ymask.shape
+        stop_y0, stop_y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
+
+        lane_mask = cv2.bitwise_or(ymask, wmask)
+
+        gray_bev = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
+        sobely = cv2.Sobel(gray_bev, cv2.CV_64F, 0, 1, ksize=3)
+        sobely = cv2.convertScaleAbs(sobely)
+        _, stop_edge_mask = cv2.threshold(sobely, 35, 255, cv2.THRESH_BINARY)
+
+        roi_stop_mask = lane_mask[stop_y0:stop_y1, :].copy()
+        
+        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+        lane_only_part = cv2.morphologyEx(roi_stop_mask, cv2.MORPH_OPEN, vert_kernel)
+        
+        pure_stop_candidate = cv2.subtract(roi_stop_mask, lane_only_part)
+        pure_stop_candidate = cv2.bitwise_and(pure_stop_candidate, stop_edge_mask[stop_y0:stop_y1, :])
+
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 1))
+        final_stop_mask = cv2.morphologyEx(pure_stop_candidate, cv2.MORPH_OPEN, horiz_kernel)
+
+        ypx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, ymask[stop_y0:stop_y1, :]))
+        wpx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, wmask[stop_y0:stop_y1, :]))
+
+        stop = "NONE"
+        if ypx > w * self.stop_thr:
+            stop = "YELLOW"
+        elif wpx > w * self.stop_thr:
+            stop = "WHITE"
+
+        lane = lane_mask.copy()
+        if stop != "NONE":
+            lane[stop_y0:stop_y1, :][final_stop_mask > 0] = 0
+        cut = int(self.lane_cut * h)
+        lane[cut:, :] = 0
+        lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+
+        lfit, rfit = self._fit(lane)
+        debug_bev = self._debug_line(bev, lane, lfit, rfit, stop, ypx, wpx, stop)
+        return lfit, rfit, stop, debug_bev
+
     @staticmethod
-    def _clamp_i(v: int, low: int, high: int) -> int:
-        return max(int(low), min(int(high), int(v)))
+    def _base(hist, lo, hi, fallback):
+        lo, hi = max(0, int(lo)), min(len(hist), int(hi))
+        if hi <= lo:
+            return int(fallback)
+        seg = hist[lo:hi]
+        if np.max(seg) <= 0:
+            return int(fallback)
+        return int(np.argmax(seg) + lo)
+
+    def _fit(self, binimg):
+        hist = np.sum(binimg[binimg.shape[0] // 2:, :], axis=0)
+        mid = len(hist) // 2
+
+        if self.mdir == "RIGHT":
+            lx = self._base(hist, mid - 100, mid + 100, mid // 2)
+            rx = self._base(hist, mid + 150, len(hist), mid + mid // 2)
+        elif self.mdir == "LEFT":
+            lx = self._base(hist, 0, mid - 150, mid // 2)
+            rx = self._base(hist, mid - 100, mid + 100, mid + mid // 2)
+        else:
+            lx = self._base(hist, 0, mid, mid // 2)
+            rx = self._base(hist, mid, len(hist), mid + mid // 2)
+
+        nw = max(3, self.nw)
+        win_h = binimg.shape[0] // nw
+        nz = binimg.nonzero()
+        nzy, nzx = np.array(nz[0]), np.array(nz[1])
+        lidx, ridx = [], []
+
+        for win in range(nw):
+            ylo = binimg.shape[0] - (win + 1) * win_h
+            yhi = binimg.shape[0] - win * win_h
+            llo, lhi = lx - self.margin, lx + self.margin
+            rlo, rhi = rx - self.margin, rx + self.margin
+
+            gl = ((nzy >= ylo) & (nzy < yhi) & (nzx >= llo) & (nzx < lhi)).nonzero()[0]
+            gr = ((nzy >= ylo) & (nzy < yhi) & (nzx >= rlo) & (nzx < rhi)).nonzero()[0]
+            lidx.append(gl)
+            ridx.append(gr)
+            
+            if len(gl) > self.minpix:
+                lx = int(np.mean(nzx[gl]))
+            if len(gr) > self.minpix:
+                rx = int(np.mean(nzx[gr]))
+
+        EXPECTED_L_X = int(self.w * (150/640))
+        EXPECTED_R_X = int(self.w * (490/640))
+        IMG_BOTTOM_Y = self.h - 1
+
+        ANCHOR_WEIGHT = 30 
+
+        l_fit_res, r_fit_res = None, None
+        
+        try:
+            li = np.concatenate(lidx) if lidx else np.array([], np.int32)
+            
+            if len(li) >= self.minpts:
+                real_y = nzy[li]
+                real_x = nzx[li]
+
+                anchor_y = np.full(ANCHOR_WEIGHT, IMG_BOTTOM_Y)
+                anchor_x = np.full(ANCHOR_WEIGHT, EXPECTED_L_X)
+
+                final_y = np.concatenate([real_y, anchor_y])
+                final_x = np.concatenate([real_x, anchor_x])
+
+                if len(li) < self.minpts * 1.5:
+                    tmp_f = np.polyfit(final_y, final_x, 1)
+                    l_fit_res = np.array([0.0, tmp_f[0], tmp_f[1]])
+                else:
+                    l_fit_res = np.polyfit(final_y, final_x, 2)
+            
+            ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
+            if len(ri) >= self.minpts:
+                real_y = nzy[ri]
+                real_x = nzx[ri]
+
+                anchor_y = np.full(ANCHOR_WEIGHT, IMG_BOTTOM_Y)
+                anchor_x = np.full(ANCHOR_WEIGHT, EXPECTED_R_X)
+
+                final_y = np.concatenate([real_y, anchor_y])
+                final_x = np.concatenate([real_x, anchor_x])
+
+                r_fit_res = np.polyfit(final_y, final_x, 2)
+
+        except Exception:
+            pass
+
+        return l_fit_res, r_fit_res
+
+    @staticmethod
+    def _poly_x(f, y):
+        return (f[0] * y * y) + (f[1] * y) + f[2]
+
+    def _debug_line(self, bev, lane, lf, rf, stop, ypx, wpx, color):
+        debug_bev = bev.copy()
+        debug_bev[:, :, 1] = np.maximum(debug_bev[:, :, 1], (lane // 2).astype(np.uint8))
+
+        h, w = debug_bev.shape[:2]
+
+        if color != "NONE":
+            y0 = int(self.stop_y0 * h)
+            y1 = int(self.stop_y1 * h)
+            box_color = (0, 255, 255) if stop == "YELLOW" else (200, 200, 200)
+            cv2.rectangle(debug_bev, (0, y0), (w, y1), box_color, 4)
+            cv2.putText(debug_bev, f"{stop} LINE", (w // 2 - 100, y0 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, box_color, 2)
+
+        ptsL, ptsR = [], []
+        plot_y = np.linspace(h - 1, 0, h // 20).astype(int)
+
+        if lf is not None:
+            for y in plot_y:
+                lx = self._poly_x(lf, y)
+                if 0 <= lx < w:
+                    ptsL.append((int(lx), y))
+            if len(ptsL) >= 2:
+                cv2.polylines(debug_bev, [np.array(ptsL)], False, (255, 0, 0), 2)
+
+        if rf is not None:
+            for y in plot_y:
+                rx = self._poly_x(rf, y)
+                if 0 <= rx < w:
+                    ptsR.append((int(rx), y))
+            if len(ptsR) >= 2:
+                cv2.polylines(debug_bev, [np.array(ptsR)], False, (0, 0, 255), 2)
+
+        # [수정] Center Path 시각화 (초록색 선)
+        if len(self.center_path_pts) >= 2:
+            cv2.polylines(debug_bev, [self.center_path_pts], False, (0, 255, 0), 2)
+
+        detect_status = []
+        if lf is not None: detect_status.append("L")
+        if rf is not None: detect_status.append("R")
+        detect_str = "+".join(detect_status) if detect_status else "NONE"
+
+        cv2.putText(debug_bev, f"{self.mdir} {self.mstatus} STOP:{stop} DET:{detect_str}",
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
+        cv2.putText(debug_bev, f"Y:{ypx} W:{wpx}", (10, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
+        
+        return debug_bev
+
+    def _debug_light(self, debug_frame, min_h, max_h, min_w, max_w, light):
+        color = (0, 0, 0)
+        if light == "GREEN":
+            color = (0, 255, 0)
+        elif light == "YELLOW":
+            color = (0, 255, 255)
+        else:
+            color = (0, 0, 255)
+        cv2.rectangle(debug_frame, (min_w, min_h), (max_w, max_h) , color, thickness=3)
+
+    def _traffic_light(self, frame, debug_frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h, w = hsv.shape[:2]
+        roi = hsv[0:int(h * 0.4), int(w * 0.2):int(w * 0.8)]
+        red = cv2.countNonZero(cv2.bitwise_or(cv2.inRange(roi, *self.RED1), cv2.inRange(roi, *self.RED2)))
+        yel = cv2.countNonZero(cv2.inRange(roi, *self.YELLOW))
+        grn = cv2.countNonZero(cv2.inRange(roi, *self.GREEN))
+        best = max((red, "RED"), (yel, "YELLOW"), (grn, "GREEN"))[1]
+        light_result = best if max(red, yel, grn) > 200 else "UNKNOWN"
+        self.pub_tl.publish(light_result)
+
+        if light_result != "UNKNOWN":
+            self._debug_light(debug_frame, 0, int(h * 0.4), int(w * 0.2), int(w * 0.8), light_result)
+        return debug_frame
+
+    def _ar_tag(self, frame, debug_frame):
+        if not hasattr(cv2, "aruco"):
+            return
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        ar = cv2.aruco
+        dic = ar.getPredefinedDictionary(ar.DICT_6X6_250)
+        prm = ar.DetectorParameters()
+        detector = ar.ArucoDetector(dic, prm)
+        corners, ids, _ = detector.detectMarkers(gray)
+        if ids is None:
+            return
+
+        cv2.aruco.drawDetectedMarkers(debug_frame, corners, ids, (255, 0, 0))
+
+        tag = float(rospy.get_param("~tag_size", 0.15))
+        focal = float(rospy.get_param("~focal_length", 600.0))
+        cx = gray.shape[1] * 0.5
+
+        out = []
+        for i in range(len(ids)):
+            c = corners[i][0]
+            pw = float(np.linalg.norm(c[0] - c[1]))
+            if pw <= 1e-6:
+                continue
+            dist = (tag * focal) / pw
+            ang = float(np.arctan2(float(np.mean(c[:, 0]) - cx), focal))
+            out += [float(ids[i]), dist, ang]
+        if out:
+            self.pub_ar.publish(Float32MultiArray(data=out))
+        return debug_frame
+
+    def run(self):
+        rospy.spin()
 
 
 if __name__ == "__main__":
-    DecisionNode().run()
+    CameraPerception().run()

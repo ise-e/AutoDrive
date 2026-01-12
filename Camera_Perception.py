@@ -50,6 +50,8 @@ class CameraPerception:
         self.overlay_on = bool(get_param("~overlay_enable", True))
         self.jpg_q = int(get_param("~jpeg_quality", 80))
 
+        self.center_pts = []
+
         # ---------- BEV ----------
         src_pts_ratio = get_param(
             "~src_pts_ratio",
@@ -107,6 +109,7 @@ class CameraPerception:
         rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1)
         rospy.Subscriber("/mission_direction", String, self._on_mission_direction, queue_size=1)
         rospy.Subscriber("/mission_status", String, self._on_mission_status, queue_size=1)
+        rospy.Subscriber("/center", Float32MultiArray, self._on_center, queue_size=1)
 
         rospy.loginfo("[CamPerc] refactored | cam=%s overlay=%s", self.cam_topic, self.overlay_topic)
 
@@ -228,6 +231,16 @@ class CameraPerception:
         combined_view = np.hstack([debug_frame, debug_bev])
         self._publish_overlay(combined_view)
 
+    def _on_center(self, msg: Float32MultiArray):
+        # 데이터를 받아서 시각화용 변수에 저장 (1차원 리스트 -> (x,y) 리스트 변환 필요)
+        data = msg.data
+        pts = []
+        # Decision.py에서 [y1, x1, y2, x2, ...] 순서로 보낸다고 가정 시:
+        if len(data) % 2 == 0:
+            for i in range(0, len(data), 2):
+                pts.append((int(data[i+1]), int(data[i]))) # cv2.polylines는 (x, y) 순서
+        self.center = pts # 시각화에서 사용할 변수
+    
     # ---------------- algorithms (원본 로직 유지) ----------------
     def _lane_stop(self, bev):
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
@@ -426,32 +439,10 @@ class CameraPerception:
             if len(ptsR) >= 2:
                 cv2.polylines(debug_bev, [np.array(ptsR)], False, (0, 0, 255), 2)  # 빨간색
 
-        # (3) 주행 중심선 그리기 (양쪽 다 있을 때만)
-        ptsC = []
-        LINE_WIDTH_PX = 400
-        if lf is not None and rf is not None:
-            for y in plot_y:
-                lx = self._poly_x(lf, y)
-                rx = self._poly_x(rf, y)
-                if 0 <= lx < w and 0 <= rx < w:
-                    cx = (lx + rx) * 0.5
-                    ptsC.append((int(cx), y))
-        elif lf is not None:
-            for y in plot_y:
-                lx = self._poly_x(lf, y)
-                cx = lx + LINE_WIDTH_PX / 2
-                if 0 <= cx < w: 
-                    ptsC.append((int(cx), y))
-
-        elif rf is not None:
-            for y in plot_y:
-                rx = self._poly_x(rf, y)
-                cx = rx - LINE_WIDTH_PX / 2
-                if 0 <= cx < w: 
-                    ptsC.append((int(cx), y))
-
-        if len(ptsC) >= 2:
-            cv2.polylines(debug_bev, [np.array(ptsC)], False, (0, 255, 0), 2)  # 초록색
+        if len(self.center_pts) >= 2:
+            cv2.polylines(debug_bev, [np.array(self.center_pts)], False, (0, 255, 0), 2)  # 초록색
+        guide_line = np.array([(320, 479), (320, 360)], dtype=np.int32)
+        cv2.polylines(debug_bev, [guide_line], False, (255, 255, 0), 2)
 
         # 3. 상태 텍스트
         detect_status = []

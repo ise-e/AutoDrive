@@ -281,6 +281,7 @@ class DecisionNode:
         self.pub_motor = rospy.Publisher("/motor", Int16MultiArray, queue_size=1)
         self.pub_dir = rospy.Publisher("/mission_direction", String, queue_size=1)
         self.pub_status = rospy.Publisher("/mission_status", String, queue_size=1)
+        self.pub_center = rospy.Publisher("/center", Float32MultiArray, queue_size=1)
 
         self.pub_viz = None
         if self.cfg.lane_marker_enable and self.cfg.lane_marker_topic:
@@ -323,6 +324,12 @@ class DecisionNode:
                 lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])
         else:
             lane = None
+        self.center = [] 
+        if lane:
+            for y in range(0, 640, 20): 
+                cx = lane.x_center(y)
+                self.center.extend([float(y), float(cx)]) # [y, x, y, x...] 순서
+        
         self._up("lane", lane)
 
     def _cb_obs_lane(self, m: Float32MultiArray) -> None:
@@ -455,7 +462,11 @@ class DecisionNode:
         self.pub_dir.publish(f.mission_direction)
         # FINISH는 외부에서 STOP처럼 다루는 경우가 많아 STOP으로 내보냄
         self.pub_status.publish("STOP" if f.mission_status == "FINISH" else f.mission_status)
-
+        if self.center:
+            msg = Float32MultiArray()
+            msg.data = self.center
+            self.pub_center.publish(msg)
+        
         # viz
         if self.pub_viz and s.lane:
             try:

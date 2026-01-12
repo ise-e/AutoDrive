@@ -363,16 +363,20 @@ class CameraPerception:
                 if 0 <= lx < w and 0 <= rx < w:
                     cx = (lx + rx) * 0.5
                     ptsC.append((int(cx), y))
-        elif lf:
+        elif lf is not None:
             for y in plot_y:
                 lx = self._poly_x(lf, y)
-                cx = lx+LINE_WIDTH_PX
-                if 0 <= cx < w: ptsC.append((int(cx), y))
-        else:
+                cx = lx + LINE_WIDTH_PX / 2
+                if 0 <= cx < w: 
+                    ptsC.append((int(cx), y))
+
+        elif rf is not None:
             for y in plot_y:
                 rx = self._poly_x(rf, y)
-                cx = rx-LINE_WIDTH_PX
-                if 0 <= cx < w: ptsC.append((int(cx), y))
+                cx = rx - LINE_WIDTH_PX / 2
+                if 0 <= cx < w: 
+                    ptsC.append((int(cx), y))
+                    
         if len(ptsC) >= 2:
             cv2.polylines(debug_bev, [np.array(ptsC)], False, (0, 255, 0), 2)  # 초록색
 

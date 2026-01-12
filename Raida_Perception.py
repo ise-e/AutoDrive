@@ -71,7 +71,7 @@ class RaidaLanePrediction:
         # 전처리: 극좌표를 직교좌표(x, y)로 변환
         for i, r in enumerate(msg.ranges):
             # 무한대나 유효하지 않은 값 제외
-            if r < self.roi_front_min_limit or r > self.roi_front_max_limit:
+            if math.isnan(r) or r < self.roi_front_min_limit or r > self.roi_front_max_limit:
                 continue
         
             angle = msg.angle_min + i * msg.angle_increment

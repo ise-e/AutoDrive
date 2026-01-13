@@ -176,14 +176,14 @@ class CameraPerception:
             # 이미지 최하단
             y_bot = self.h - 1
             # 이미지 상단
-            y_top = int(self.h * 0.3)
+            y_top = int(self.h * 0.4)
             # 각 지점에서의 너비 계산
             w_bot = self._poly_x(rfit, y_bot) - self._poly_x(lfit, y_bot)
             w_top = self._poly_x(rfit, y_top) - self._poly_x(lfit, y_top)
             # 너비 변화량 (Width Deviation)
             width_deviation = abs(w_top - w_bot)
             # 차이가 60 이상일 경우 **값 조정 필요
-            if width_deviation > 60 or w_top < 60:
+            if width_deviation > 40 or w_top < 100:
                 if w_top < w_bot:  # 상단으로 갈수록 너비가 좁아지는 경우 (수렴)
                     if self.mdir == "LEFT":
                         # 왼쪽으로 가야 하는데 왼쪽이 좁아지면, 확실한 오른쪽 선을 기준으로 주행
@@ -408,26 +408,6 @@ class CameraPerception:
         # Y좌표 생성 (이미지 하단 -> 상단)
         plot_y = np.linspace(h - 1, 0, h // 20).astype(int)
 
-        LINE_WIDTH_PX = 400
-        if lf is None or rf is None:
-            base_lane = rf if lf is None else lf
-            if base_lane is None: base_lane = [0, 0, w/2+200]
-            grad = -base_lane[0]*h**2+base_lane[1]*h
-            if grad < 0:
-                if rf is None:
-                    rf = base_lane
-                    lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
-                else:
-                    lf = base_lane
-                    rf = (base_lane[0], base_lane[1], base_lane[2]+LINE_WIDTH_PX)
-            else:
-                if lf is None:
-                    lf = base_lane
-                    rf = (base_lane[0], base_lane[1], base_lane[2]+LINE_WIDTH_PX)
-                else:
-                    rf = base_lane
-                    lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
-        
         # (1) 왼쪽 차선 그리기
         if lf is not None:
             for y in plot_y:
@@ -448,16 +428,31 @@ class CameraPerception:
 
         # (3) 주행 중심선 그리기 (양쪽 다 있을 때만)
         ptsC = []
-        for y in plot_y:
-            lx = self._poly_x(lf, y)
-            rx = self._poly_x(rf, y)
-            cx = (lx + rx) * 0.5
-            if 0 <= cx < w:
-                ptsC.append((int(cx), y))
+        LINE_WIDTH_PX = 400
+        if lf is not None and rf is not None:
+            for y in plot_y:
+                lx = self._poly_x(lf, y)
+                rx = self._poly_x(rf, y)
+                if 0 <= lx < w and 0 <= rx < w:
+                    cx = (lx + rx) * 0.5
+                    ptsC.append((int(cx), y))
+        elif lf is not None:
+            for y in plot_y:
+                lx = self._poly_x(lf, y)
+                cx = lx + LINE_WIDTH_PX / 2
+                if 0 <= cx < w: 
+                    ptsC.append((int(cx), y))
+
+        elif rf is not None:
+            for y in plot_y:
+                rx = self._poly_x(rf, y)
+                cx = rx - LINE_WIDTH_PX / 2
+                if 0 <= cx < w: 
+                    ptsC.append((int(cx), y))
 
         if len(ptsC) >= 2:
             cv2.polylines(debug_bev, [np.array(ptsC)], False, (0, 255, 0), 2)  # 초록색
-        cv2.polylines(debug_bev, [np.array([(w//2, h), (w//2, h*2//3)])], False, (0, 255, 255), 2)
+
         # 3. 상태 텍스트
         detect_status = []
         if lf is not None: detect_status.append("L")

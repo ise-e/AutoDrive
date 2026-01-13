@@ -113,7 +113,8 @@ class RaidaLanePrediction:
             
             if len(arr) >= self.min_cluster_size:
                 center = np.array(self.fit_circle(arr))
-                obstacle_center_arr.append(center)
+                if center[2] >= self.roi_front_min_limit:
+                    obstacle_center_arr.append(center)
 
         obstacle_center_arr = sorted(obstacle_center_arr, key=lambda x: x[2])
 

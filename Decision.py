@@ -35,29 +35,6 @@ class Lane:
         rx = ra * y * y + rb * y + rc
         return 0.5 * (lx + rx)
 
-
-@dataclass
-class ObsLane:
-    """라바콘(장애물) 통로 다항식 계수.
-    Raida_Perception에서 생성되는 모델: y = a*x^2 + b*x + c
-      - x: 전방거리(m)
-      - y: 좌우오프셋(m, ROS base_link 기준으로 +y는 좌측)
-    coeffs: [la, lb, lc, ra, rb, rc]
-    """
-    c: List[float]
-
-    def y_center(self, x: float) -> float:
-        la, lb, lc, ra, rb, rc = self.c
-        yl = la * x * x + lb * x + lc
-        yr = ra * x * x + rb * x + rc
-        return 0.5 * (yl + yr)
-
-    def half_width(self, x: float) -> float:
-        la, lb, lc, ra, rb, rc = self.c
-        yl = la * x * x + lb * x + lc
-        yr = ra * x * x + rb * x + rc
-        return 0.5 * abs(yr - yl)
-
     def x_poly(self, y: float, is_left: bool) -> float:
         base = 0 if is_left else 3
         return self.c[base] * y * y + self.c[base + 1] * y + self.c[base + 2]
@@ -68,7 +45,7 @@ class Snap:
     """루프 1회에서 사용하는 입력 스냅샷(원자적 캡처)"""
     t: float
     lane: Optional[Lane]
-    obs_lane: Optional[ObsLane]
+    obs_lane: Optional[Lane]
     stop: str
     light: str
     ar: Optional[Tuple[float, float]]   # (dist_m, ang_rad)
@@ -351,7 +328,7 @@ class DecisionNode:
     def _cb_obs_lane(self, m: Float32MultiArray) -> None:
         data = list(m.data) if len(m.data) else []
         if len(data):
-            obs_lane = ObsLane(data)
+            obs_lane = Lane(data)
         else:
             obs_lane = None
         self._up("obs_lane", obs_lane)
@@ -414,17 +391,13 @@ class DecisionNode:
         # 1) Lane -> steer
         if s.obs_lane:
             speed = 98
-            x = float(self.cfg.obs_eval_x)
-            # ObsLane: y(m) = f(x). +y는 좌측(base_link). Decision의 조향 규약(+는 우회전)을 맞추기 위해 부호를 반대로 사용.
-            y_center = s.obs_lane.y_center(x)
-            half_w = max(1e-6, s.obs_lane.half_width(x))
-            err_norm = (-y_center) / half_w
+            err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
             p_term = err_norm * float(self.cfg.kp * 5)
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
         elif s.lane:
             y = self.cfg.h//3 if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
-            half_w = max(1.0, float(self.cfg.w))
-            err_norm = (s.lane.x_center(y) - half_w) / half_w
+            center_x = max(1.0, float(self.cfg.w) * 0.5)
+            err_norm = (s.lane.x_center(y) - center_x) / center_x
             p_term = err_norm * float(self.cfg.kp)
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         else:
@@ -437,7 +410,6 @@ class DecisionNode:
         steer = self.cfg.cen + int(p_term + d_term + i_term)
         self.prev_error = err_norm
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
-
         self.prev_steer = steer
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 

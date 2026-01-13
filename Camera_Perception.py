@@ -73,7 +73,7 @@ class CameraPerception:
         # ---------- stopline ----------
         self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
         self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
-        self.stop_thr = float(get_param("~stop_px_per_col", 4.0))
+        self.stop_thr = float(get_param("~stop_px_per_col", 20.0))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
         # 정지선 검증을 위한 파라미터
@@ -230,56 +230,61 @@ class CameraPerception:
 
     # ---------------- algorithms (원본 로직 유지) ----------------
     def _lane_stop(self, bev):
+        # 1. 마스크 생성
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
         ymask = cv2.inRange(hsv, *self.YELLOW)
         wmask = cv2.inRange(hsv, *self.WHITE)
-
+        
         h, w = ymask.shape
-        stop_y0, stop_y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
-
-        # 차선 피팅용 전체 마스크 생성
-        lane_mask = cv2.bitwise_or(ymask, wmask)
-
-        # Sobel Y 연산, 수직 방향 그레이디언트 강조
-        gray_bev = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
-        sobely = cv2.Sobel(gray_bev, cv2.CV_64F, 0, 1, ksize=3)
-        sobely = cv2.convertScaleAbs(sobely)
-        _, stop_edge_mask = cv2.threshold(sobely, 35, 255, cv2.THRESH_BINARY)
-
-        # 정지선 후보 영역 추출
-        roi_stop_mask = lane_mask[stop_y0:stop_y1, :].copy()
+        lane = cv2.bitwise_or(ymask, wmask) # 전체 차선 마스크
         
-        # 세로로 긴 커널을 사용하여 '차선'인 부분을 찾고, 이를 정지선 후보에서 뺍니다.
-        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
-        lane_only_part = cv2.morphologyEx(roi_stop_mask, cv2.MORPH_OPEN, vert_kernel)
+        # 정지선 ROI 설정
+        y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
+        if y1 <= y0: y1 = min(h, y0 + 1)
         
-        # 정지선 후보 = (원본 마스크 - 세로 성분) & SobelY 가로 엣지
-        pure_stop_candidate = cv2.subtract(roi_stop_mask, lane_only_part)
-        pure_stop_candidate = cv2.bitwise_and(pure_stop_candidate, stop_edge_mask[stop_y0:stop_y1, :])
-
-        # 최종 가로 필터 적용
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 1))
-        final_stop_mask = cv2.morphologyEx(pure_stop_candidate, cv2.MORPH_OPEN, horiz_kernel)
-
-        ypx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, ymask[stop_y0:stop_y1, :]))
-        wpx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, wmask[stop_y0:stop_y1, :]))
-
         stop = "NONE"
-        if ypx > w * self.stop_thr:
-            stop = "YELLOW"
-        elif wpx > w * self.stop_thr:
-            stop = "WHITE"
+        stop_contour = None
 
-        lane = lane_mask.copy()
-        if stop != "NONE":
-            lane[stop_y0:stop_y1, :][final_stop_mask > 0] = 0
+        # 2. 정지선 탐지 및 제거용 컨투어 추출
+        for mask, color_name in [(ymask, "YELLOW"), (wmask, "WHITE")]:
+            roi = mask[y0:y1, :]
+            contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area > (w * (y1 - y0) * self.stop_thr):
+                    rect = cv2.minAreaRect(cnt)
+                    (_, _), (lw, lh), angle = rect
+                    
+                    w_line = max(lw, lh)
+                    h_line = min(lw, lh)
+                    aspect_ratio = w_line / h_line if h_line > 0 else 0
+                    
+                    # 정지선 조건 (가로가 길고, 수직이 아님)
+                    if w_line > w * 0.4 and aspect_ratio > 2.0:
+                        stop = color_name
+                        stop_contour = cnt
+                        # ROI 좌표를 전체 이미지 좌표로 변환 (y0 더하기)
+                        stop_contour[:, :, 1] += y0 
+                        break
+            if stop != "NONE": break
+
+        if stop_contour is not None:
+            cv2.drawContours(lane, [stop_contour], -1, 0, thickness=cv2.FILLED)
+
+        # 4. 차선 피팅 (정지선이 제거된 lane 사용)
         cut = int(self.lane_cut * h)
         lane[cut:, :] = 0
         lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
 
         lfit, rfit = self._fit(lane)
+        
+        # 디버깅용 변수 계산 및 반환
+        ypx = cv2.countNonZero(ymask[y0:y1, :])
+        wpx = cv2.countNonZero(wmask[y0:y1, :])
         debug_bev = self._debug_line(bev, lane, lfit, rfit, stop, ypx, wpx, stop)
+        
         return lfit, rfit, stop, debug_bev
 
     @staticmethod
@@ -408,6 +413,26 @@ class CameraPerception:
         # Y좌표 생성 (이미지 하단 -> 상단)
         plot_y = np.linspace(h - 1, 0, h // 20).astype(int)
 
+        LINE_WIDTH_PX = 400
+        if lf is None or rf is None:
+            base_lane = rf if lf is None else lf
+            if base_lane is None: base_lane = [0, 0, w/2+200]
+            grad = -base_lane[0]*h**2+base_lane[1]*h
+            if grad < 0:
+                if rf is None:
+                    rf = base_lane
+                    lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
+                else:
+                    lf = base_lane
+                    rf = (base_lane[0], base_lane[1], base_lane[2]+LINE_WIDTH_PX)
+            else:
+                if lf is None:
+                    lf = base_lane
+                    rf = (base_lane[0], base_lane[1], base_lane[2]+LINE_WIDTH_PX)
+                else:
+                    rf = base_lane
+                    lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
+        
         # (1) 왼쪽 차선 그리기
         if lf is not None:
             for y in plot_y:
@@ -428,31 +453,16 @@ class CameraPerception:
 
         # (3) 주행 중심선 그리기 (양쪽 다 있을 때만)
         ptsC = []
-        LINE_WIDTH_PX = 400
-        if lf is not None and rf is not None:
-            for y in plot_y:
-                lx = self._poly_x(lf, y)
-                rx = self._poly_x(rf, y)
-                if 0 <= lx < w and 0 <= rx < w:
-                    cx = (lx + rx) * 0.5
-                    ptsC.append((int(cx), y))
-        elif lf is not None:
-            for y in plot_y:
-                lx = self._poly_x(lf, y)
-                cx = lx + LINE_WIDTH_PX / 2
-                if 0 <= cx < w: 
-                    ptsC.append((int(cx), y))
-
-        elif rf is not None:
-            for y in plot_y:
-                rx = self._poly_x(rf, y)
-                cx = rx - LINE_WIDTH_PX / 2
-                if 0 <= cx < w: 
-                    ptsC.append((int(cx), y))
+        for y in plot_y:
+            lx = self._poly_x(lf, y)
+            rx = self._poly_x(rf, y)
+            cx = (lx + rx) * 0.5
+            if 0 <= cx < w:
+                ptsC.append((int(cx), y))
 
         if len(ptsC) >= 2:
             cv2.polylines(debug_bev, [np.array(ptsC)], False, (0, 255, 0), 2)  # 초록색
-
+        cv2.polylines(debug_bev, [np.array([(w//2, h), (w//2, h*2//3)])], False, (0, 255, 255), 2)
         # 3. 상태 텍스트
         detect_status = []
         if lf is not None: detect_status.append("L")

@@ -308,7 +308,7 @@ class DecisionNode:
     def _cb_lane(self, m: Float32MultiArray) -> None:
         data = list(m.data) if m.data else []
         n = len(data)
-        y_eval = 100
+        y_eval = 470
         LINE_WIDTH_PX = 400  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
         if n >= 6:
             # 양쪽 차선 정상 수신
@@ -316,8 +316,8 @@ class DecisionNode:
         elif n >= 3:
             # 한쪽 차선만 수신 (a, b, c 추출)
             a, b, c = data[0], data[1], data[2]
-            grad = 2*a*y_eval + b
-            if grad < 0: # 감지된 것이 오른쪽 차선일 때
+            target_x = a * (y_eval**2) + b * y_eval + c
+            if target_x > 320: # 감지된 것이 오른쪽 차선일 때
                 lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
             else: # 감지된 것이 왼쪽 차선일 때
                 lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])
@@ -395,11 +395,11 @@ class DecisionNode:
             p_term = err_norm * float(self.cfg.kp * 5)
             d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
         elif s.lane:
-            y = (self.cfg.h - 20) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
-            half_w = max(1.0, float(self.cfg.w) * 0.5)
+            y = self.cfg.h//3 if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+            half_w = max(1.0, float(self.cfg.w)/2.0)
             err_norm = (s.lane.x_center(y) - half_w) / half_w
-            p_term = err_norm * float(self.cfg.kp * 5)
-            d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
+            p_term = err_norm * float(self.cfg.kp)
+            d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         else:
             self.accum_error = 0.0
             self.prev_error = 0.0
@@ -407,7 +407,7 @@ class DecisionNode:
 
         self.accum_error += err_norm
         i_term = self.accum_error * float(self.cfg.ki)
-        steer = self.cfg.cen - int(p_term + d_term + i_term)
+        steer = self.cfg.cen + int(p_term + d_term + i_term)
         self.prev_error = err_norm
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 

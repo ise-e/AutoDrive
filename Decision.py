@@ -309,7 +309,7 @@ class DecisionNode:
         data = list(m.data) if m.data else []
         n = len(data)
         y_eval = 470
-        LINE_WIDTH_PX = 400  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
+        LINE_WIDTH_PX = 440  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
         if n >= 6:
             # 양쪽 차선 정상 수신
             lane = Lane(data)
@@ -393,9 +393,9 @@ class DecisionNode:
             speed = 98
             err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
         elif s.lane:
-            y = self.cfg.h//3 if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+            y = int(self.cfg.h * 2/3) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w)/2.0)
-            err_norm = (s.lane.x_center(y) - half_w) * self.cfg.meters_per_pixel_x
+            err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
         else:
             self.accum_error = 0.0
             self.prev_error = 0.0

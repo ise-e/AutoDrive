@@ -53,7 +53,7 @@ class CameraPerception:
         # ---------- BEV ----------
         src_pts_ratio = get_param(
             "~src_pts_ratio",
-            [150/640, 300/480, 490/640, 300/480, 10/640, 450/480, 630/640, 450/480]
+            [200/640, 300/480, 440/640, 300/480, 50/640, 450/480, 590/640, 450/480]
         )
         dst_pts_ratio = get_param(
             "~dst_pts_ratio",
@@ -249,9 +249,7 @@ class CameraPerception:
         elif wpx > w * self.stop_thr:
             stop = "WHITE"
 
-        lane = lane_mask.copy()
-        if stop != "NONE":
-            lane[stop_y0:stop_y1, :][final_stop_mask > 0] = 0
+        lane = cv2.bitwise_or(ymask, wmask)
         cut = int(self.lane_cut * h)
         lane[cut:, :] = 0
         lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)

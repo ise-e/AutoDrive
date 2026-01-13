@@ -229,33 +229,62 @@ class CameraPerception:
         self._publish_overlay(combined_view)
 
     # ---------------- algorithms (원본 로직 유지) ----------------
-    def _lane_stop(self, bev):
+def _lane_stop(self, bev):
+        # 1. 마스크 생성
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
         ymask = cv2.inRange(hsv, *self.YELLOW)
         wmask = cv2.inRange(hsv, *self.WHITE)
-
+        
         h, w = ymask.shape
+        lane = cv2.bitwise_or(ymask, wmask) # 전체 차선 마스크
+        
+        # 정지선 ROI 설정
         y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
-        if y1 <= y0:
-            y1 = min(h, y0 + 1)
-
-        ypx = cv2.countNonZero(ymask[y0:y1, :])
-        wpx = cv2.countNonZero(wmask[y0:y1, :])
-
+        if y1 <= y0: y1 = min(h, y0 + 1)
+        
         stop = "NONE"
-        if ypx > w * self.stop_thr:
-            stop = "YELLOW"
-        elif wpx > w * self.stop_thr:
-            stop = "WHITE"
+        stop_contour = None
 
-        lane = cv2.bitwise_or(ymask, wmask)
+        # 2. 정지선 탐지 및 제거용 컨투어 추출
+        for mask, color_name in [(ymask, "YELLOW"), (wmask, "WHITE")]:
+            roi = mask[y0:y1, :]
+            contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area > (w * (y1 - y0) * self.stop_thr):
+                    rect = cv2.minAreaRect(cnt)
+                    (_, _), (lw, lh), angle = rect
+                    
+                    w_line = max(lw, lh)
+                    h_line = min(lw, lh)
+                    aspect_ratio = w_line / h_line if h_line > 0 else 0
+                    
+                    # 정지선 조건 (가로가 길고, 수직이 아님)
+                    if w_line > w * 0.4 and aspect_ratio > 2.0:
+                        stop = color_name
+                        stop_contour = cnt
+                        # ROI 좌표를 전체 이미지 좌표로 변환 (y0 더하기)
+                        stop_contour[:, :, 1] += y0 
+                        break
+            if stop != "NONE": break
+
+        if stop_contour is not None:
+            cv2.drawContours(lane, [stop_contour], -1, 0, thickness=cv2.FILLED)
+
+        # 4. 차선 피팅 (정지선이 제거된 lane 사용)
         cut = int(self.lane_cut * h)
         lane[cut:, :] = 0
         lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
 
         lfit, rfit = self._fit(lane)
+        
+        # 디버깅용 변수 계산 및 반환
+        ypx = cv2.countNonZero(ymask[y0:y1, :])
+        wpx = cv2.countNonZero(wmask[y0:y1, :])
         debug_bev = self._debug_line(bev, lane, lfit, rfit, stop, ypx, wpx, stop)
+        
         return lfit, rfit, stop, debug_bev
 
     @staticmethod

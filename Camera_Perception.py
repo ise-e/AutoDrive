@@ -53,7 +53,7 @@ class CameraPerception:
         # ---------- BEV ----------
         src_pts_ratio = get_param(
             "~src_pts_ratio",
-            [200/640, 300/480, 440/640, 300/480, 50/640, 450/480, 590/640, 450/480]
+            [150/640, 300/480, 490/640, 300/480, 10/640, 450/480, 630/640, 450/480]
         )
         dst_pts_ratio = get_param(
             "~dst_pts_ratio",
@@ -73,7 +73,7 @@ class CameraPerception:
         # ---------- stopline ----------
         self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
         self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
-        self.stop_thr = float(get_param("~stop_px_per_col", 4.0))
+        self.stop_thr = float(get_param("~stop_px_per_col", 20.0))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
         # 정지선 검증을 위한 파라미터
@@ -236,34 +236,12 @@ class CameraPerception:
         wmask = cv2.inRange(hsv, *self.WHITE)
 
         h, w = ymask.shape
-        stop_y0, stop_y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
+        y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
+        if y1 <= y0:
+            y1 = min(h, y0 + 1)
 
-        # 차선 피팅용 전체 마스크 생성
-        lane_mask = cv2.bitwise_or(ymask, wmask)
-
-        # Sobel Y 연산, 수직 방향 그레이디언트 강조
-        gray_bev = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
-        sobely = cv2.Sobel(gray_bev, cv2.CV_64F, 0, 1, ksize=3)
-        sobely = cv2.convertScaleAbs(sobely)
-        _, stop_edge_mask = cv2.threshold(sobely, 35, 255, cv2.THRESH_BINARY)
-
-        # 정지선 후보 영역 추출
-        roi_stop_mask = lane_mask[stop_y0:stop_y1, :].copy()
-        
-        # 세로로 긴 커널을 사용하여 '차선'인 부분을 찾고, 이를 정지선 후보에서 뺍니다.
-        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
-        lane_only_part = cv2.morphologyEx(roi_stop_mask, cv2.MORPH_OPEN, vert_kernel)
-        
-        # 정지선 후보 = (원본 마스크 - 세로 성분) & SobelY 가로 엣지
-        pure_stop_candidate = cv2.subtract(roi_stop_mask, lane_only_part)
-        pure_stop_candidate = cv2.bitwise_and(pure_stop_candidate, stop_edge_mask[stop_y0:stop_y1, :])
-
-        # 최종 가로 필터 적용
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 1))
-        final_stop_mask = cv2.morphologyEx(pure_stop_candidate, cv2.MORPH_OPEN, horiz_kernel)
-
-        ypx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, ymask[stop_y0:stop_y1, :]))
-        wpx = cv2.countNonZero(cv2.bitwise_and(final_stop_mask, wmask[stop_y0:stop_y1, :]))
+        ypx = cv2.countNonZero(ymask[y0:y1, :])
+        wpx = cv2.countNonZero(wmask[y0:y1, :])
 
         stop = "NONE"
         if ypx > w * self.stop_thr:

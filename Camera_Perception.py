@@ -230,60 +230,89 @@ class CameraPerception:
 
     # ---------------- algorithms (원본 로직 유지) ----------------
     def _lane_stop(self, bev):
-        # 1. 마스크 생성
+        h, w = bev.shape[:2]
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
+        # 1. 마스크 생성 (한 번만)
         ymask = cv2.inRange(hsv, *self.YELLOW)
         wmask = cv2.inRange(hsv, *self.WHITE)
+        lane_mask = cv2.bitwise_or(ymask, wmask)
         
-        h, w = ymask.shape
-        lane = cv2.bitwise_or(ymask, wmask) # 전체 차선 마스크
+        # 2. 정지선 ROI 설정
+        y0 = int(self.stop_y0 * h)
+        y1 = int(self.stop_y1 * h)
+        if y1 <= y0:
+            y1 = min(h, y0 + 1)
         
-        # 정지선 ROI 설정
-        y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
-        if y1 <= y0: y1 = min(h, y0 + 1)
+        # 3. ROI 영역에서 정지선 탐지
+        roi_lane = lane_mask[y0:y1, :]
+        
+        # 수평 커널로 세로 차선 제거 (기울어진 정지선도 고려)
+        # 20도 기울기 대응: 약간 더 관대한 커널 사용
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 7))
+        stop_roi = cv2.morphologyEx(roi_lane, cv2.MORPH_OPEN, h_kernel)
+        stop_roi = cv2.morphologyEx(stop_roi, cv2.MORPH_CLOSE, h_kernel)
+
+        # 4. 정지선 컨투어 추출
+        contours, _ = cv2.findContours(stop_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         stop = "NONE"
-        stop_contour = None
+        stop_mask = None
+        area_thr = w * (y1 - y0) * self.stop_thr
+        width_thr = w * 0.4
 
-        # 2. 정지선 탐지 및 제거용 컨투어 추출
-        for mask, color_name in [(ymask, "YELLOW"), (wmask, "WHITE")]:
-            roi = mask[y0:y1, :]
-            contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area <= area_thr:
+                continue
+                
+            x, y, bw, bh = cv2.boundingRect(cnt)
             
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > (w * (y1 - y0) * self.stop_thr):
-                    rect = cv2.minAreaRect(cnt)
-                    (_, _), (lw, lh), angle = rect
-                    
-                    w_line = max(lw, lh)
-                    h_line = min(lw, lh)
-                    aspect_ratio = w_line / h_line if h_line > 0 else 0
-                    
-                    # 정지선 조건 (가로가 길고, 수직이 아님)
-                    if w_line > w * 0.4 and aspect_ratio > 2.0:
-                        stop = color_name
-                        stop_contour = cnt
-                        # ROI 좌표를 전체 이미지 좌표로 변환 (y0 더하기)
-                        stop_contour[:, :, 1] += y0 
-                        break
-            if stop != "NONE": break
+            # 조건 체크 (기울어진 흰색 정지선 대응)
+            if bh == 0 or bw <= width_thr:
+                continue
+                
+            aspect_ratio = bw / float(bh)
+            # 20도 기울기: aspect_ratio ≈ 2.75, 여유값 2.0으로 완화
+            if aspect_ratio <= 2.0:
+                continue
+            
+            # 색상 판별 (ROI 슬라이싱 한 번만)
+            roi_y_slice = slice(y0 + y, y0 + y + bh)
+            roi_x_slice = slice(x, x + bw)
+            
+            ypx_cnt = cv2.countNonZero(ymask[roi_y_slice, roi_x_slice])
+            wpx_cnt = cv2.countNonZero(wmask[roi_y_slice, roi_x_slice])
+            
+            stop = "YELLOW" if ypx_cnt > wpx_cnt else "WHITE"
+            
+            stop_mask = np.zeros_like(lane_mask)
+            # 좌표 변환 없이 직접 ROI 좌표에 그리기
+            cv2.drawContours(stop_mask[y0:y1, :], [cnt], -1, 255, thickness=cv2.FILLED)
+            break
 
-        if stop_contour is not None:
-            cv2.drawContours(lane, [stop_contour], -1, 0, thickness=cv2.FILLED)
-
-        # 4. 차선 피팅 (정지선이 제거된 lane 사용)
-        cut = int(self.lane_cut * h)
-        lane[cut:, :] = 0
-        lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
-
-        lfit, rfit = self._fit(lane)
+        # 5. 디버깅용 ROI 픽셀 수 계산 (정지선 제거 전)
+        ypx_roi = cv2.countNonZero(ymask[y0:y1, :])
+        wpx_roi = cv2.countNonZero(wmask[y0:y1, :])
         
-        # 디버깅용 변수 계산 및 반환
-        ypx = cv2.countNonZero(ymask[y0:y1, :])
-        wpx = cv2.countNonZero(wmask[y0:y1, :])
-        debug_bev = self._debug_line(bev, lane, lfit, rfit, stop, ypx, wpx, stop)
+        # 6. 차선 정제 (정지선 제거)
+        clean_lane = lane_mask  # 이름 유지 (가독성)
+        if stop_mask is not None:
+            clean_lane = lane_mask & ~stop_mask  # 비트 연산으로 최적화
+        
+        # 상단 절단
+        cut = int(self.lane_cut * h)
+        clean_lane[cut:, :] = 0
+        
+        # 모폴로지 연산 (in-place)
+        kernel_3x3 = np.ones((3, 3), np.uint8)
+        cv2.morphologyEx(clean_lane, cv2.MORPH_CLOSE, kernel_3x3, dst=clean_lane)
+
+        # 7. 차선 피팅
+        lfit, rfit = self._fit(clean_lane)
+        
+        # 8. 디버깅 정보 생성
+        debug_bev = self._debug_line(bev, clean_lane, lfit, rfit, stop, ypx_roi, wpx_roi, stop)
         
         return lfit, rfit, stop, debug_bev
 

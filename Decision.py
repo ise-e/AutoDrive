@@ -316,8 +316,8 @@ class DecisionNode:
         elif n >= 3:
             # 한쪽 차선만 수신 (a, b, c 추출)
             a, b, c = data[0], data[1], data[2]
-            grad = -a*self.cfg.h**2+b*self.cfg.h
-            if grad < 0: # 감지된 것이 오른쪽 차선일 때
+            target_x = a * (target_y**2) + b * target_y + c
+            if target_x > 320: # 감지된 것이 오른쪽 차선일 때
                 lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
             else: # 감지된 것이 왼쪽 차선일 때
                 lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])

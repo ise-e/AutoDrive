@@ -229,7 +229,7 @@ class CameraPerception:
         self._publish_overlay(combined_view)
 
     # ---------------- algorithms (원본 로직 유지) ----------------
-def _lane_stop(self, bev):
+    def _lane_stop(self, bev):
         # 1. 마스크 생성
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 

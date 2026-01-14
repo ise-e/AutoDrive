@@ -449,7 +449,8 @@ class CameraPerception:
             res = self._ar_tag(frame, debug_frame)
             if res is not None:
                 debug_frame = res
-
+        if debug_bev is None:
+            debug_bev = bev.copy()
         combined_view = np.hstack([debug_frame, debug_bev])
         self._publish_overlay(combined_view)
 
@@ -656,7 +657,18 @@ class CameraPerception:
         clean_lane[cut:, :] = 0
 
         # 5) Fit lanes
-        lfit, rfit, debug_bev = self._fit(clean_lane)
+        lfit, rfit = self._fit(clean_lane)
+
+        # debug_bev는 hstack 때문에 무조건 ndarray로 만들어야 안전함
+        try:
+            ypx = int(dbg_stop.get("peak_norm", 0.0) * 100.0)
+            wpx = int(dbg_stop.get("cov", 0.0) * 100.0)
+        except Exception:
+            ypx, wpx = 0, 0
+
+        color = stop if stop != "NONE" else "NONE"
+        debug_bev = self._debug_line(bev, clean_lane, lfit, rfit, stop, ypx, wpx, color)
+
 
         # (optional) lightweight debug overlay
         if debug_bev is not None:
@@ -674,6 +686,7 @@ class CameraPerception:
 
         return lfit, rfit, stop, debug_bev
 
+    @staticmethod
     def _base(hist, lo, hi, fallback):
         lo, hi = max(0, int(lo)), min(len(hist), int(hi))
         if hi <= lo:

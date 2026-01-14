@@ -85,10 +85,10 @@ class CameraPerception:
         self.last_fit = None
         self.last_fit_t = 0.0
         
-
         # ---------- mission state ----------
         self.mdir = "RIGHT"
         self.mstatus = "NONE"
+        self.is_white = False
 
         # ---------- HSV ranges ----------
         self.RED1 = (np.array([0, 100, 100]),   np.array([10, 255, 255]))
@@ -246,6 +246,7 @@ class CameraPerception:
         # 1. 마스크 생성 (한 번만)
         ymask = cv2.inRange(hsv, *self.YELLOW)
         wmask = cv2.inRange(hsv, *self.WHITE)
+        # 정지선용 통합 마스크
         lane_mask = cv2.bitwise_or(ymask, wmask)
         
         # 2. 정지선 ROI 설정
@@ -294,35 +295,60 @@ class CameraPerception:
             ypx_cnt = cv2.countNonZero(ymask[roi_y_slice, roi_x_slice])
             wpx_cnt = cv2.countNonZero(wmask[roi_y_slice, roi_x_slice])
             
-            stop = "YELLOW" if ypx_cnt > wpx_cnt else "WHITE"
+            if (ypx_cnt > wpx_cnt) :
+                stop = "YELLOW"
+            else :
+                stop = "WHITE"
+                self.is_white = True
             
             stop_mask = np.zeros_like(lane_mask)
             # 좌표 변환 없이 직접 ROI 좌표에 그리기
             cv2.drawContours(stop_mask[y0:y1, :], [cnt], -1, 255, thickness=cv2.FILLED)
             break
-
-        # 5. 디버깅용 ROI 픽셀 수 계산 (정지선 제거 전)
-        ypx_roi = cv2.countNonZero(ymask[y0:y1, :])
-        wpx_roi = cv2.countNonZero(wmask[y0:y1, :])
         
         # 6. 차선 정제 (정지선 제거)
-        clean_lane = lane_mask  # 이름 유지 (가독성)
+        clean_y = ymask.copy()
+        clean_w = wmask.copy()
+        
         if stop_mask is not None:
-            clean_lane = lane_mask & ~stop_mask  # 비트 연산으로 최적화
+            clean_y &= ~stop_mask
+            clean_w &= ~stop_mask
         
         # 상단 절단
         cut = int(self.lane_cut * h)
-        clean_lane[cut:, :] = 0
-        
-        # 모폴로지 연산 (in-place)
         kernel_3x3 = np.ones((3, 3), np.uint8)
-        cv2.morphologyEx(clean_lane, cv2.MORPH_CLOSE, kernel_3x3, dst=clean_lane)
+
+        # 모폴로지 연산 (in-place)
+        for mask in [clean_y, clean_w]:
+            mask[cut:, :] = 0
+            cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_3x3, dst=mask)
 
         # 7. 차선 피팅
-        lfit, rfit = self._fit(clean_lane)
+        y_lfit, y_rfit = self._fit(clean_y)
+        w_lfit, w_rfit = self._fit(clean_w)
+
+        # 8. 상태 및 우선순위에 따른 통합 피팅 결정
+        lfit, rfit = None, None
+
+        # 조건 1: 흰색 모드가 아니거나, 진행 방향이 LEFT인 경우 (노란색 우선)
+        if (not self.is_white) or (self.mdir == "LEFT"):
+            if y_lfit is not None or y_rfit is not None:
+                lfit, rfit = y_lfit, y_rfit
+            else:
+                lfit, rfit = w_lfit, w_rfit
+        # 조건 2: 그 외 상황 (흰색 우선)
+        else:
+            if w_lfit is not None or w_rfit is not None:
+                lfit, rfit = w_lfit, w_rfit
+            else:
+                lfit, rfit = y_lfit, y_rfit
+
+        combined_clean = cv2.bitwise_or(clean_y, clean_w)
         
         # 8. 디버깅 정보 생성
-        debug_bev = self._debug_line(bev, clean_lane, lfit, rfit, stop, ypx_roi, wpx_roi, stop)
+        ypx_roi = cv2.countNonZero(ymask[y0:y1, :])
+        wpx_roi = cv2.countNonZero(wmask[y0:y1, :])
+        debug_bev = self._debug_line(bev, combined_clean, lfit, rfit, stop, ypx_roi, wpx_roi, stop)
         
         return lfit, rfit, stop, debug_bev
 

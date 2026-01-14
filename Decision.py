@@ -87,6 +87,9 @@ class Config:
     watchdog_soft_sec: float = 0.5   # 관성 주행 허용 시간
     watchdog_hard_sec: float = 1.5   # 비상 정지 발동 시간
     park_stop_dist: float = 0.3      # 주차 정지 거리 (m)
+    park_search_sec: float = 1.5     # AR 미검출 시 탐색 지속 시간 (s)
+    park_search_speed: int = 99    # AR 미검출 탐색 속도 (PWM)
+
 
 # ==============================================================================
 # 2. Data Structures (Immutable Snapshots)
@@ -336,7 +339,7 @@ class MissionManager:
 
         elif self.state == MissionState.PARKING_EXEC:
             # 주차 거리 도달
-            if s.ar_dist is not None and s.ar_dist <= 0.3: # Config 값 참조 필요
+            if s.ar_dist is not None and s.ar_dist <= self.cfg.park_stop_dist: # Config 값 참조 필요
                 self._to(MissionState.FINISH, now)
 
         return self._status_str()
@@ -394,6 +397,9 @@ class DecisionNode:
 
             ar_steer_gain=float(rospy.get_param("~ar_steer_gain", 1.0)),
             park_stop_dist=float(rospy.get_param("~park_stop_dist", 0.3)),
+
+            park_search_sec=float(rospy.get_param("~park_search_sec", 1.5)),
+            park_search_speed=int(rospy.get_param("~park_search_speed", 99)),
 
             fork_bias_pwm=int(rospy.get_param("~fork_bias_pwm", 0)),
 
@@ -554,16 +560,26 @@ class DecisionNode:
                     steer, speed = self.cfg.steer_center, 0
 
             elif status == "PARKING":
-                # AR 태그 추종
+                # AR 태그 추종 (+ 미검출 시 짧은 저속 탐색)
                 if s.ar_dist is not None and s.ar_angle is not None:
+                    # AR이 보이면: 정밀 추종
+                    self._park_no_ar_start = None
                     angle_deg = math.degrees(float(s.ar_angle))
                     if self.cfg.steer_invert:
                         angle_deg = -angle_deg
                     steer = self.ctrl._clamp(self.cfg.steer_center + int(self.cfg.ar_steer_gain * angle_deg))
                     speed = int(self.cfg.speed_parking)
                 else:
-                    steer = self.cfg.steer_center
-                    speed = int(self.cfg.speed_min)
+                    # AR이 안 보이면: 1~2초 정도 직진 탐색(크립) 후 정지
+                    if self._park_no_ar_start is None:
+                        self._park_no_ar_start = now
+
+                    if float(now - self._park_no_ar_start) <= float(self.cfg.park_search_sec):
+                        steer = self.cfg.steer_center
+                        speed = int(self.cfg.park_search_speed)
+                    else:
+                        steer = self.cfg.steer_center
+                        speed = int(self.cfg.speed_min)
 
             else:
                 # 일반 주행: 센서 퓨전 + Soft Fallback

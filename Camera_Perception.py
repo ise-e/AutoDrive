@@ -73,8 +73,12 @@ class CameraPerception:
         # ---------- stopline ----------
         self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
         self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
-        self.stop_thr = float(get_param("~stop_px_per_col", 15.0))
+        self.stop_thr = float(get_param("~stop_px_per_col", 20.0))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
+
+        # 정지선 검증을 위한 파라미터
+        self.stop_line_angle_thr = float(get_param("~stop_line_angle_threshold", 20.0))  # 수평선 허용 각도
+        self.stop_line_min_length = float(get_param("~stop_line_min_length", 100.0))  # 최소 선 길이
 
         # ---------- dropout hold ----------
         self.hold_sec = float(get_param("~last_fit_hold_sec", 0.5))
@@ -179,7 +183,7 @@ class CameraPerception:
             # 너비 변화량 (Width Deviation)
             width_deviation = abs(w_top - w_bot)
             # 차이가 60 이상일 경우 **값 조정 필요
-            if width_deviation > 60:
+            if width_deviation > 60 or w_top < 60:
                 if w_top < w_bot:  # 상단으로 갈수록 너비가 좁아지는 경우 (수렴)
                     if self.mdir == "LEFT":
                         # 왼쪽으로 가야 하는데 왼쪽이 좁아지면, 확실한 오른쪽 선을 기준으로 주행
@@ -206,7 +210,12 @@ class CameraPerception:
             self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
         # 둘 다 미검지 ** 이 부분은 나중에 판단 노드로 옮길 생각입니다
         else:
-            self.pub_lane.publish(Float32MultiArray(data=[]))
+            if self.last_fit is not None and (now_sec() - self.last_fit_t) < self.hold_sec:
+                lfit_last, rfit_last = self.last_fit
+                self.pub_lane.publish(Float32MultiArray(data=list(lfit_last) + list(rfit_last)))
+            else:
+                self.pub_lane.publish(Float32MultiArray(data=[]))
+            
 
         if self.mstatus == "STOP":
             debug_frame = self._traffic_light(frame, debug_frame)
@@ -221,32 +230,90 @@ class CameraPerception:
 
     # ---------------- algorithms (원본 로직 유지) ----------------
     def _lane_stop(self, bev):
+        h, w = bev.shape[:2]
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
+        # 1. 마스크 생성 (한 번만)
         ymask = cv2.inRange(hsv, *self.YELLOW)
         wmask = cv2.inRange(hsv, *self.WHITE)
-
-        h, w = ymask.shape
-        y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
+        lane_mask = cv2.bitwise_or(ymask, wmask)
+        
+        # 2. 정지선 ROI 설정
+        y0 = int(self.stop_y0 * h)
+        y1 = int(self.stop_y1 * h)
         if y1 <= y0:
             y1 = min(h, y0 + 1)
+        
+        # 3. ROI 영역에서 정지선 탐지
+        roi_lane = lane_mask[y0:y1, :]
+        
+        # 수평 커널로 세로 차선 제거 (기울어진 정지선도 고려)
+        # 20도 기울기 대응: 약간 더 관대한 커널 사용
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 7))
+        stop_roi = cv2.morphologyEx(roi_lane, cv2.MORPH_OPEN, h_kernel)
+        stop_roi = cv2.morphologyEx(stop_roi, cv2.MORPH_CLOSE, h_kernel)
 
-        ypx = cv2.countNonZero(ymask[y0:y1, :])
-        wpx = cv2.countNonZero(wmask[y0:y1, :])
-
+        # 4. 정지선 컨투어 추출
+        contours, _ = cv2.findContours(stop_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         stop = "NONE"
-        if ypx > w * self.stop_thr:
-            stop = "YELLOW"
-        elif wpx > w * self.stop_thr:
-            stop = "WHITE"
+        stop_mask = None
+        area_thr = w * (y1 - y0) * self.stop_thr
+        width_thr = w * 0.4
 
-        lane = cv2.bitwise_or(ymask, wmask)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area <= area_thr:
+                continue
+                
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            
+            # 조건 체크 (기울어진 흰색 정지선 대응)
+            if bh == 0 or bw <= width_thr:
+                continue
+                
+            aspect_ratio = bw / float(bh)
+            # 20도 기울기: aspect_ratio ≈ 2.75, 여유값 2.0으로 완화
+            if aspect_ratio <= 2.0:
+                continue
+            
+            # 색상 판별 (ROI 슬라이싱 한 번만)
+            roi_y_slice = slice(y0 + y, y0 + y + bh)
+            roi_x_slice = slice(x, x + bw)
+            
+            ypx_cnt = cv2.countNonZero(ymask[roi_y_slice, roi_x_slice])
+            wpx_cnt = cv2.countNonZero(wmask[roi_y_slice, roi_x_slice])
+            
+            stop = "YELLOW" if ypx_cnt > wpx_cnt else "WHITE"
+            
+            stop_mask = np.zeros_like(lane_mask)
+            # 좌표 변환 없이 직접 ROI 좌표에 그리기
+            cv2.drawContours(stop_mask[y0:y1, :], [cnt], -1, 255, thickness=cv2.FILLED)
+            break
+
+        # 5. 디버깅용 ROI 픽셀 수 계산 (정지선 제거 전)
+        ypx_roi = cv2.countNonZero(ymask[y0:y1, :])
+        wpx_roi = cv2.countNonZero(wmask[y0:y1, :])
+        
+        # 6. 차선 정제 (정지선 제거)
+        clean_lane = lane_mask  # 이름 유지 (가독성)
+        if stop_mask is not None:
+            clean_lane = lane_mask & ~stop_mask  # 비트 연산으로 최적화
+        
+        # 상단 절단
         cut = int(self.lane_cut * h)
-        lane[cut:, :] = 0
-        lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+        clean_lane[cut:, :] = 0
+        
+        # 모폴로지 연산 (in-place)
+        kernel_3x3 = np.ones((3, 3), np.uint8)
+        cv2.morphologyEx(clean_lane, cv2.MORPH_CLOSE, kernel_3x3, dst=clean_lane)
 
-        lfit, rfit = self._fit(lane)
-        debug_bev = self._debug_line(bev, lane, lfit, rfit, stop, ypx, wpx, stop)
+        # 7. 차선 피팅
+        lfit, rfit = self._fit(clean_lane)
+        
+        # 8. 디버깅 정보 생성
+        debug_bev = self._debug_line(bev, clean_lane, lfit, rfit, stop, ypx_roi, wpx_roi, stop)
+        
         return lfit, rfit, stop, debug_bev
 
     @staticmethod
@@ -295,15 +362,55 @@ class CameraPerception:
             if len(gr) > self.minpix:
                 rx = int(np.mean(nzx[gr]))
 
+        EXPECTED_L_X = int(self.w * (150/640))  # 약 150px
+        EXPECTED_R_X = int(self.w * (490/640))  # 약 490px
+        IMG_BOTTOM_Y = self.h - 1               # 479px
+
+        # 가중치 (앵커 점을 몇 개나 추가할지) - 높을수록 고정력 강함
+        # 차가 흔들릴 때 유연성을 주려면 10~20, 강력하게 고정하려면 50 이상
+        ANCHOR_WEIGHT = 30 
+
         l_fit_res, r_fit_res = None, None
+        
         try:
             li = np.concatenate(lidx) if lidx else np.array([], np.int32)
-            if len(li) >= self.minpts:
-                l_fit_res = np.polyfit(nzy[li], nzx[li], 2)
             
+            # [왼쪽 차선 피팅]
+            if len(li) >= self.minpts:
+                # 1. 실제 검출된 점들
+                real_y = nzy[li]
+                real_x = nzx[li]
+
+                # 2. 앵커(고정) 점 생성: 맨 아래(IMG_BOTTOM_Y)에 EXPECTED_L_X 좌표를 여러 개 추가
+                anchor_y = np.full(ANCHOR_WEIGHT, IMG_BOTTOM_Y)
+                anchor_x = np.full(ANCHOR_WEIGHT, EXPECTED_L_X)
+
+                # 3. 데이터 합치기 (실제 점 + 앵커 점)
+                final_y = np.concatenate([real_y, anchor_y])
+                final_x = np.concatenate([real_x, anchor_x])
+
+                # 4. 합친 데이터로 피팅
+                if len(li) < self.minpts * 1.5:
+                    tmp_f = np.polyfit(final_y, final_x, 1)
+                    l_fit_res = np.array([0.0, tmp_f[0], tmp_f[1]])
+                else:
+                    l_fit_res = np.polyfit(final_y, final_x, 2)
+            
+            # [오른쪽 차선 피팅]
             ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
             if len(ri) >= self.minpts:
-                r_fit_res = np.polyfit(nzy[ri], nzx[ri], 2)
+                real_y = nzy[ri]
+                real_x = nzx[ri]
+
+                # 앵커 추가
+                anchor_y = np.full(ANCHOR_WEIGHT, IMG_BOTTOM_Y)
+                anchor_x = np.full(ANCHOR_WEIGHT, EXPECTED_R_X)
+
+                final_y = np.concatenate([real_y, anchor_y])
+                final_x = np.concatenate([real_x, anchor_x])
+
+                r_fit_res = np.polyfit(final_y, final_x, 2)
+
         except Exception:
             pass
 
@@ -320,7 +427,7 @@ class CameraPerception:
 
         h, w = debug_bev.shape[:2]
 
-        # 1. 정지선 박스 그리기
+        # 1. 정지선 박스 그리기 
         if color != "NONE":
             y0 = int(self.stop_y0 * h)
             y1 = int(self.stop_y1 * h)
@@ -335,6 +442,26 @@ class CameraPerception:
         # Y좌표 생성 (이미지 하단 -> 상단)
         plot_y = np.linspace(h - 1, 0, h // 20).astype(int)
 
+        LINE_WIDTH_PX = 400
+        if lf is None or rf is None:
+            base_lane = rf if lf is None else lf
+            if base_lane is None: base_lane = [0, 0, w/2+200]
+            grad = -base_lane[0]*h**2+base_lane[1]*h
+            if grad < 0:
+                if rf is None:
+                    rf = base_lane
+                    lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
+                else:
+                    lf = base_lane
+                    rf = (base_lane[0], base_lane[1], base_lane[2]+LINE_WIDTH_PX)
+            else:
+                if lf is None:
+                    lf = base_lane
+                    rf = (base_lane[0], base_lane[1], base_lane[2]+LINE_WIDTH_PX)
+                else:
+                    rf = base_lane
+                    lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
+        
         # (1) 왼쪽 차선 그리기
         if lf is not None:
             for y in plot_y:
@@ -355,31 +482,16 @@ class CameraPerception:
 
         # (3) 주행 중심선 그리기 (양쪽 다 있을 때만)
         ptsC = []
-        LINE_WIDTH_PX = 400
-        if lf is not None and rf is not None:
-            for y in plot_y:
-                lx = self._poly_x(lf, y)
-                rx = self._poly_x(rf, y)
-                if 0 <= lx < w and 0 <= rx < w:
-                    cx = (lx + rx) * 0.5
-                    ptsC.append((int(cx), y))
-        elif lf is not None:
-            for y in plot_y:
-                lx = self._poly_x(lf, y)
-                cx = lx + LINE_WIDTH_PX / 2
-                if 0 <= cx < w: 
-                    ptsC.append((int(cx), y))
+        for y in plot_y:
+            lx = self._poly_x(lf, y)
+            rx = self._poly_x(rf, y)
+            cx = (lx + rx) * 0.5
+            if 0 <= cx < w:
+                ptsC.append((int(cx), y))
 
-        elif rf is not None:
-            for y in plot_y:
-                rx = self._poly_x(rf, y)
-                cx = rx - LINE_WIDTH_PX / 2
-                if 0 <= cx < w: 
-                    ptsC.append((int(cx), y))
-                    
         if len(ptsC) >= 2:
             cv2.polylines(debug_bev, [np.array(ptsC)], False, (0, 255, 0), 2)  # 초록색
-
+        cv2.polylines(debug_bev, [np.array([(w//2, h), (w//2, h*2//3)])], False, (0, 255, 255), 2)
         # 3. 상태 텍스트
         detect_status = []
         if lf is not None: detect_status.append("L")

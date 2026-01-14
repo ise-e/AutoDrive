@@ -224,8 +224,8 @@ class DecisionNode:
             "cen": int(gp("steer_center", 90)),
             "min": int(gp("steer_min", 45)),
             "max": int(gp("steer_max", 135)),
-            "kp": float(gp("kp_steer", 45.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
-            "kd": float(gp("kd_steer", 15)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
+            "kp": float(gp("kp_steer", 225.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
+            "kd": float(gp("kd_steer", 750)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
             "ki": float(gp("ki_steer", 0.0001)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
             "spd_drive": int(gp("speed_drive", 100)),
             "spd_stop": int(gp("speed_stop", 90)),
@@ -252,7 +252,7 @@ class DecisionNode:
 
             # viz
             "base_frame": str(gp("base_frame", "base_link")),
-            "meters_per_pixel_x": float(gp("meters_per_pixel_x", 0.01)),
+            "meters_per_pixel_x": float(gp("meters_per_pixel_x", 9.0703e-4)), # w의 3분의 1일 때
             "meters_per_pixel_y": float(gp("meters_per_pixel_y", 0.01)),
             "lane_marker_enable": bool(gp("lane_marker_enable", True)),
             "lane_marker_topic": str(gp("lane_marker_topic", "/viz/lanes")),
@@ -308,16 +308,16 @@ class DecisionNode:
     def _cb_lane(self, m: Float32MultiArray) -> None:
         data = list(m.data) if m.data else []
         n = len(data)
-        y_eval = 200
-        LINE_WIDTH_PX = 400  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
+        y_eval = 470
+        LINE_WIDTH_PX = 440  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
         if n >= 6:
             # 양쪽 차선 정상 수신
             lane = Lane(data)
         elif n >= 3:
             # 한쪽 차선만 수신 (a, b, c 추출)
             a, b, c = data[0], data[1], data[2]
-            grad = 2*a*y_eval + b*y_eval
-            if grad < 0: # 감지된 것이 오른쪽 차선일 때
+            target_x = a * (y_eval**2) + b * y_eval + c
+            if target_x > 320: # 감지된 것이 오른쪽 차선일 때
                 lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
             else: # 감지된 것이 왼쪽 차선일 때
                 lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])
@@ -392,20 +392,18 @@ class DecisionNode:
         if s.obs_lane:
             speed = 98
             err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
-            p_term = err_norm * float(self.cfg.kp * 5)
-            d_term = (err_norm - self.prev_error) * float(self.cfg.kd * 50.0)
         elif s.lane:
-            y = (self.cfg.h - 1) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
-            half_w = max(1.0, float(self.cfg.w) * 0.5)
-            err_norm = (s.lane.x_center(y) - half_w) / half_w
-            p_term = err_norm * float(self.cfg.kp)
-            d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
+            y = int(self.cfg.h * 2/3) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+            half_w = max(1.0, float(self.cfg.w)/2.0)
+            err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
         else:
             self.accum_error = 0.0
             self.prev_error = 0.0
             return int(self.cfg.cen), max(int(speed), int(self.cfg.speed_min_run))
 
         self.accum_error += err_norm
+        p_term = err_norm * float(self.cfg.kp)
+        d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         i_term = self.accum_error * float(self.cfg.ki)
         steer = self.cfg.cen - int(p_term + d_term + i_term)
         self.prev_error = err_norm

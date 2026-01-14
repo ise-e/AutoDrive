@@ -142,19 +142,21 @@ class LegacyScenarioFSM:
 
         if self.state == self.YELLOW_STOP_1:
             # 노란선 감지: STOP, GREEN이면 출발
-            if not self.is_stop and stop == "YELLOW":
+            if stop == "YELLOW" and self._debounced(s.t, self._ts_yellow):
+                self._ts_yellow = s.t
                 self.is_stop = True
-                return FsmOut(self.mission_direction, "STOP")
+                out = FsmOut(self.mission_direction, "STOP")
             elif light == "GREEN":
                 self.state = self.DRIVE_RIGHT
                 self.is_stop = False
+                s.light = "UNKNOWN"
                 out = FsmOut(self.mission_direction, "NONE")
-            elif light == "UNKNOWN":
-                self.is_stop = False
+            elif not self.is_stop:
                 out = FsmOut(self.mission_direction, "NONE")
             else:
                 self.is_stop = True
                 out = FsmOut(self.mission_direction, "STOP")
+
             if prev_state != self.state:
                 self._log_transition(prev_state, self.state, s, out)
             return out
@@ -171,8 +173,8 @@ class LegacyScenarioFSM:
 
         if self.state == self.DRIVE_LEFT:
             # 2차 노란선 만나면 STOP2 진입
-            if stop == "YELLOW" and self._debounced(s.t, self._ts_yellow):
-                self._ts_yellow = s.t
+            if stop == "YELLOW":
+                self.is_stop = True
                 self.state = self.YELLOW_STOP_2
                 out = FsmOut(self.mission_direction, "STOP")
                 if prev_state != self.state:
@@ -182,19 +184,10 @@ class LegacyScenarioFSM:
 
         if self.state == self.YELLOW_STOP_2:
             # 노란선 위에서는 STOP, GREEN이면 PARKING
-            if not self.is_stop and stop == "YELLOW":
-                self.is_stop = True
-                s.light = "UNKNOWN"
-                out = FsmOut(self.mission_direction, "STOP")
-            
-            elif light == "GREEN":
+            if light == "GREEN":
                 self.is_stop = False
                 self.state = self.PARKING
-                out = FsmOut(self.mission_direction, "NONE")
-            
-            elif light == "UNKNOWN":
-                self.is_stop = False
-                out = FsmOut(self.mission_direction, "NONE")
+                out = FsmOut(self.mission_direction, "PARKING")
             else:
                 self.is_stop = True
                 out = FsmOut(self.mission_direction, "STOP")
@@ -441,22 +434,27 @@ class DecisionNode:
 
     def _parking_cmd(self, s: Snap) -> Tuple[int, int]:
         # AR 없으면 잠깐 천천히 탐색 -> 그래도 없으면 정지
+        """
         if s.ar is None:
             if self._ts_ar_missing <= 0.0:
                 self._ts_ar_missing = s.t
             if (s.t - self._ts_ar_missing) <= float(self.cfg.park_search_sec):
                 return int(self.cfg.cen), max(int(self.cfg.speed_min_run), int(self.cfg.park_search_speed))
             return int(self.cfg.cen), int(self.cfg.spd_stop)
+        """
+        if s.ar is None:
+            steer, speed = self._drive_cmd(s)
+            return int(steer), int(speed)
+        else:
+            self._ts_ar_missing = 0.0
+            dist_m, ang_rad = float(s.ar[0]), float(s.ar[1])
 
-        self._ts_ar_missing = 0.0
-        dist_m, ang_rad = float(s.ar[0]), float(s.ar[1])
+            if dist_m <= float(self.cfg.dist_p):
+                return int(self.cfg.cen), int(self.cfg.spd_stop)
 
-        if dist_m <= float(self.cfg.dist_p):
-            return int(self.cfg.cen), int(self.cfg.spd_stop)
-
-        steer = int(self.cfg.cen + int(math.degrees(ang_rad)))
-        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
-        return int(steer), max(int(self.cfg.speed_min_run), int(self.cfg.spd_parking))
+            steer = int(self.cfg.cen + int(math.degrees(ang_rad)))
+            steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+            return int(steer), max(int(self.cfg.speed_min_run), int(self.cfg.spd_parking))
 
     # ---------------- Publish ----------------
     def _publish(self, steer: int, speed: int, s: Snap, f: FsmOut) -> None:

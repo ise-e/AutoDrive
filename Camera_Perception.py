@@ -171,6 +171,29 @@ class CameraPerception:
         self.YELLOW = (np.array([15, 100, 100]), np.array([35, 255, 255]))
         self.GREEN  = (np.array([45, 100, 100]), np.array([90, 255, 255]))
         self.WHITE  = (np.array([0, 0, 200]),    np.array([179, 40, 255]))
+        # ---------- Lane color thresholds (tunable) ----------
+        # You can override via ROS params:
+        #  - ~yellow_lower_hsv / ~yellow_upper_hsv : [H,S,V]
+        #  - ~white_v_min, ~white_s_max, ~white_v_percentile
+        #  - ~lane_mask_kernel : odd int (e.g., 3 or 5)
+        yl = get_param("~yellow_lower_hsv", None)
+        yu = get_param("~yellow_upper_hsv", None)
+        if isinstance(yl, (list, tuple)) and len(yl) == 3 and isinstance(yu, (list, tuple)) and len(yu) == 3:
+            self.YELLOW = (np.array(yl, dtype=np.uint8), np.array(yu, dtype=np.uint8))
+        
+        self.white_v_min = int(get_param("~white_v_min", 170))
+        self.white_s_max = int(get_param("~white_s_max", 80))
+        self.white_v_percentile = float(get_param("~white_v_percentile", 75.0))
+        
+        self.use_lab_yellow = bool(get_param("~use_lab_yellow", True))
+        self.lab_b_min = int(get_param("~lab_b_min", 145))
+        self.lab_l_min = int(get_param("~lab_l_min", 80))
+        
+        self.lane_mask_kernel = int(get_param("~lane_mask_kernel", 3))
+        if self.lane_mask_kernel < 1:
+            self.lane_mask_kernel = 1
+        if self.lane_mask_kernel % 2 == 0:
+            self.lane_mask_kernel += 1
 
         # ---------- temporal filters ----------
         self._tl_filter = _MajorityHysteresis(
@@ -184,6 +207,23 @@ class CameraPerception:
         min_hits=rospy.get_param("~stop_min_hits", 2),
         hold_sec=rospy.get_param("~stop_hold_sec", 0.30),
         )
+
+        # ---------- fork (갈림길) 판단 파라미터 ----------
+        # pdf 규칙:
+        #  - WHITE 정지선 전: (노란 차선 1개 + 흰 차선 1개)로 갈림
+        #  - YELLOW 정지선 전: (노란 차선 2개)로 갈림
+        self.fork_check_y0 = float(rospy.get_param("~fork_check_y0", 0.40))
+        self.fork_check_y1 = float(rospy.get_param("~fork_check_y1", 0.68))
+        self.fork_smooth_win = int(max(5, int(rospy.get_param("~fork_smooth_win", 21)) | 1))  # odd
+        self.fork_peak_min_dist_px = int(max(20, int(rospy.get_param("~fork_peak_min_dist_px", 70))))
+        self.fork_peak_rel_thr = float(rospy.get_param("~fork_peak_rel_thr", 0.35))
+        self.fork_col_thr_per_row = float(rospy.get_param("~fork_col_thr_per_row", 0.06))
+        self.fork_peak_sep_thr = float(rospy.get_param("~fork_peak_sep_thr", 120.0))
+        self.fork_width_dev_thr = float(rospy.get_param("~fork_width_deviation_thr", 60.0))
+        self.fork_top_min_width = float(rospy.get_param("~fork_top_min_width", 60.0))
+        self.fork_y_ref_ratio = float(rospy.get_param("~fork_y_ref_ratio", 0.55))
+        self.fork_use_color_guidance = bool(rospy.get_param("~fork_use_color_guidance", True))
+
 
 
         # ---------- pubs ----------
@@ -330,7 +370,8 @@ class CameraPerception:
         bev = cv2.warpPerspective(frame, self.M, (self.w, self.h))
 
         lfit, rfit, stop, debug_bev = self._lane_stop(bev)
-        self.pub_stop.publish(self._stop_filter.update(stop, now_sec()))
+        stop_f = self._stop_filter.update(stop, now_sec())
+        self.pub_stop.publish(stop_f)
 
         # 양쪽 차선 모두 검지
         if lfit is not None and rfit is not None:
@@ -344,30 +385,43 @@ class CameraPerception:
             w_top = self._poly_x(rfit, y_top) - self._poly_x(lfit, y_top)
             # 너비 변화량 (Width Deviation)
             width_deviation = abs(w_top - w_bot)
-            # 차이가 60 이상일 경우 **값 조정 필요
-            if width_deviation > 60 or w_top < 60:
-                if w_top < w_bot:  # 상단으로 갈수록 너비가 좁아지는 경우 (수렴)
-                    if self.mdir == "LEFT":
-                        # 왼쪽으로 가야 하는데 왼쪽이 좁아지면, 확실한 오른쪽 선을 기준으로 주행
-                        l_syn, r_syn = self._synthesize_pair_from_single(rfit)
+
+            # --- fork pattern (pdf 규칙 기반) ---
+            ymask, wmask, _lane_mask_dbg = self._make_lane_masks(bev)
+            fork_info = self._fork_pattern_from_masks(ymask, wmask, stop_f)
+
+            need_fork = bool(fork_info.get("detected")) and (
+                (width_deviation > float(self.fork_width_dev_thr)) or
+                (w_top < float(self.fork_top_min_width)) or
+                (float(fork_info.get("sep", 0.0)) > float(self.fork_peak_sep_thr))
+            )
+
+            if need_fork:
+                if self.fork_use_color_guidance and (w_top >= w_bot):
+                    target = self._select_fork_target_peak(fork_info)
+                    if target is not None:
+                        _c, x_target = target
+                        y_ref = int(self.h * float(self.fork_y_ref_ratio))
+                        base_fit = self._choose_fit_near_x(lfit, rfit, float(x_target), y_ref)
+                        l_syn, r_syn = self._synthesize_pair_from_single(base_fit)
                         self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
-                    else: # RIGHT 미션
-                        # 오른쪽으로 가야 하는데 오른쪽이 좁아지면, 왼쪽 선을 기준으로 주행
-                        l_syn, r_syn = self._synthesize_pair_from_single(lfit)
+                    else:
+                        # 피크가 애매하면 기존 방식 fallback
+                        base = lfit if self.mdir == "LEFT" else rfit
+                        l_syn, r_syn = self._synthesize_pair_from_single(base)
                         self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
-                else:  # 상단으로 갈수록 너비가 넓어지는 경우 (발산/갈림길)
-                    if self.mdir == "LEFT":
-                        # 왼쪽 갈림길을 타기 위해 왼쪽 차선을 가이드로 선택
-                        l_syn, r_syn = self._synthesize_pair_from_single(lfit)
-                        self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
-                    else: # RIGHT 미션
-                        # 오른쪽 갈림길을 타기 위해 오른쪽 차선을 가이드로 선택
-                        l_syn, r_syn = self._synthesize_pair_from_single(rfit)
-                        self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
-            # 정상적인 경우
-            else :
+                else:
+                    # 수렴/예외: 기존 폭 기반 처리 유지
+                    if w_top < w_bot:
+                        base = rfit if self.mdir == "LEFT" else lfit
+                    else:
+                        base = lfit if self.mdir == "LEFT" else rfit
+                    l_syn, r_syn = self._synthesize_pair_from_single(base)
+                    self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
+            else:
                 self.last_fit, self.last_fit_t = (lfit, rfit), now_sec()
                 self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
+
         # 왼쪽만 검지
         elif lfit is not None:
             l_syn, r_syn = self._synthesize_pair_from_single(lfit)
@@ -400,94 +454,226 @@ class CameraPerception:
         self._publish_overlay(combined_view)
 
     # ---------------- algorithms (원본 로직 유지) ----------------
+    def _make_lane_masks(self, bev_bgr):
+        """Return (ymask, wmask, lane_mask) in BEV coordinates.
+
+        - Yellow: HSV inRange (+ optional LAB b-channel support)
+        - White : adaptive V threshold + low S threshold
+        """
+        h, w = bev_bgr.shape[:2]
+        hsv = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2HSV)
+        H, S, V = cv2.split(hsv)
+
+        # --- Yellow mask ---
+        ymask_hsv = cv2.inRange(hsv, *self.YELLOW)
+
+        if self.use_lab_yellow:
+            lab = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2LAB)
+            L, A, B = cv2.split(lab)
+            ymask_lab = cv2.inRange(B, self.lab_b_min, 255) & cv2.inRange(L, self.lab_l_min, 255)
+            ymask = cv2.bitwise_or(ymask_hsv, ymask_lab)
+        else:
+            ymask = ymask_hsv
+
+        # --- White mask (adaptive) ---
+        y0 = int(h * 0.45)
+        roi_v = V[y0:, :]
+        v_thr = int(max(self.white_v_min, np.percentile(roi_v, self.white_v_percentile)))
+        wmask = cv2.inRange(V, v_thr, 255) & cv2.inRange(S, 0, self.white_s_max)
+
+        lane_mask = cv2.bitwise_or(ymask, wmask)
+
+        # Morphology: connect broken paint, suppress speckles
+        k = self.lane_mask_kernel
+        if k >= 3:
+            ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, ker, iterations=1)
+            lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_OPEN, ker, iterations=1)
+
+        return ymask, wmask, lane_mask
+
+
+    def _smooth_1d(self, arr, win: int):
+        if win <= 1:
+            return arr
+        k = np.ones((win,), dtype=np.float32) / float(win)
+        return np.convolve(arr.astype(np.float32), k, mode="same")
+
+    def _find_peaks_1d(self, hist, rel_thr: float, min_dist: int):
+        """local maxima + greedy distance suppression"""
+        if hist is None or len(hist) == 0:
+            return []
+        h = np.asarray(hist, dtype=np.float32)
+        mx = float(h.max()) if h.size else 0.0
+        if mx <= 1e-6:
+            return []
+        thr = mx * float(rel_thr)
+        cand = []
+        for i in range(1, len(h) - 1):
+            if h[i] >= thr and h[i] >= h[i - 1] and h[i] >= h[i + 1]:
+                cand.append((float(h[i]), int(i)))
+        cand.sort(reverse=True)  # by height
+        picked = []
+        for _, x in cand:
+            if all(abs(x - px) >= int(min_dist) for px in picked):
+                picked.append(x)
+        picked.sort()
+        return picked
+
+    def _fork_pattern_from_masks(self, ymask, wmask, stop_color: str):
+        """정지선 색 규칙 기반 갈림길 패턴 감지"""
+        if stop_color not in ("WHITE", "YELLOW"):
+            return {"detected": False, "peaks_y": [], "peaks_w": [], "peaks_all": [], "sep": 0.0}
+
+        h, _w = ymask.shape[:2]
+        y0 = int(h * float(self.fork_check_y0))
+        y1 = int(h * float(self.fork_check_y1))
+        y0 = max(0, min(h - 1, y0))
+        y1 = max(y0 + 1, min(h, y1))
+
+        y_roi = ymask[y0:y1, :]
+        w_roi = wmask[y0:y1, :]
+
+        # column hist: ROI 내에서 해당 column이 얼마나 '지속적으로' 켜져있는지
+        y_hist = np.count_nonzero(y_roi > 0, axis=0).astype(np.float32)
+        w_hist = np.count_nonzero(w_roi > 0, axis=0).astype(np.float32)
+
+        roi_h = float(max(1, (y1 - y0)))
+        y_hist = y_hist / roi_h
+        w_hist = w_hist / roi_h
+
+        col_thr = float(self.fork_col_thr_per_row)
+        y_hist[y_hist < col_thr] = 0.0
+        w_hist[w_hist < col_thr] = 0.0
+
+        y_hist = self._smooth_1d(y_hist, int(self.fork_smooth_win))
+        w_hist = self._smooth_1d(w_hist, int(self.fork_smooth_win))
+
+        peaks_y = self._find_peaks_1d(y_hist, float(self.fork_peak_rel_thr), int(self.fork_peak_min_dist_px))
+        peaks_w = self._find_peaks_1d(w_hist, float(self.fork_peak_rel_thr), int(self.fork_peak_min_dist_px))
+
+        candidates = []
+        if stop_color == "WHITE":
+            candidates += [("YELLOW", x) for x in peaks_y]
+            candidates += [("WHITE", x) for x in peaks_w]
+            detected = (len(peaks_y) >= 1 and len(peaks_w) >= 1 and len(candidates) >= 2)
+        else:
+            candidates += [("YELLOW", x) for x in peaks_y]
+            detected = (len(peaks_y) >= 2)
+
+        candidates.sort(key=lambda t: t[1])
+        sep = float(candidates[-1][1] - candidates[0][1]) if len(candidates) >= 2 else 0.0
+
+        return {"detected": bool(detected), "peaks_y": peaks_y, "peaks_w": peaks_w, "peaks_all": candidates, "sep": sep}
+
+    def _select_fork_target_peak(self, fork_info: dict):
+        peaks_all = list(fork_info.get("peaks_all") or [])
+        if len(peaks_all) < 2:
+            return None
+        peaks_all.sort(key=lambda t: t[1])
+        return peaks_all[0] if self.mdir == "LEFT" else peaks_all[-1]
+
+    def _choose_fit_near_x(self, lfit, rfit, x_target: float, y_ref: int):
+        xl = float(self._poly_x(lfit, y_ref))
+        xr = float(self._poly_x(rfit, y_ref))
+        return lfit if abs(x_target - xl) <= abs(x_target - xr) else rfit
+
+    def _detect_stopline_rowproj(self, bev_bgr, ymask, wmask, roi_y0, roi_y1):
+        """Robust stopline detection using BEV + row projection of horizontal edge energy."""
+        h, w = bev_bgr.shape[:2]
+        roi_y0 = int(max(0, min(h - 1, roi_y0)))
+        roi_y1 = int(max(roi_y0 + 1, min(h, roi_y1)))
+
+        roi = bev_bgr[roi_y0:roi_y1, :]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        sob = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+        abs_sob = cv2.convertScaleAbs(sob)
+
+        thr = max(25, int(np.mean(abs_sob) + 1.0 * np.std(abs_sob)))
+        edge = cv2.inRange(abs_sob, thr, 255)
+
+        hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, w // 20), 3))
+        edge = cv2.morphologyEx(edge, cv2.MORPH_CLOSE, hk, iterations=1)
+
+        row_score = edge.sum(axis=1).astype(np.float32) / 255.0
+        if len(row_score) >= 5:
+            kernel = np.array([1, 2, 3, 2, 1], dtype=np.float32)
+            kernel /= kernel.sum()
+            row_score = np.convolve(row_score, kernel, mode="same")
+
+        peak_y = int(np.argmax(row_score))
+        peak = float(row_score[peak_y])
+        peak_norm = peak / float(w)
+
+        band = 4
+        y_a = max(0, peak_y - band)
+        y_b = min(edge.shape[0], peak_y + band + 1)
+        band_edge = edge[y_a:y_b, :]
+        cov = float(np.count_nonzero(np.any(band_edge > 0, axis=0))) / float(w)
+
+        score_thr = float(rospy.get_param("~stop_row_score_thr", 0.18))
+        cov_thr = float(rospy.get_param("~stop_row_cov_thr", 0.35))
+
+        stop = "NONE"
+        stop_mask = None
+
+        if peak_norm >= score_thr and cov >= cov_thr:
+            yy0 = roi_y0 + y_a
+            yy1 = roi_y0 + y_b
+            ycnt = int(cv2.countNonZero(ymask[yy0:yy1, :]))
+            wcnt = int(cv2.countNonZero(wmask[yy0:yy1, :]))
+            stop = "YELLOW" if ycnt > wcnt else "WHITE"
+
+            stop_mask = np.zeros((h, w), dtype=np.uint8)
+            stop_mask[yy0:yy1, :] = 255
+
+        dbg = {"peak_norm": peak_norm, "cov": cov, "thr": thr}
+        return stop, stop_mask, dbg
+
     def _lane_stop(self, bev):
         h, w = bev.shape[:2]
-        hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
-        # 1. 마스크 생성 (한 번만)
-        ymask = cv2.inRange(hsv, *self.YELLOW)
-        wmask = cv2.inRange(hsv, *self.WHITE)
-        lane_mask = cv2.bitwise_or(ymask, wmask)
-        
-        # 2. 정지선 ROI 설정
+        # 1) Lane masks (yellow/white) with robustness improvements
+        ymask, wmask, lane_mask = self._make_lane_masks(bev)
+
+        # 2) Stopline detection ROI
         y0 = int(self.stop_y0 * h)
         y1 = int(self.stop_y1 * h)
         if y1 <= y0:
             y1 = min(h, y0 + 1)
-        
-        # 3. ROI 영역에서 정지선 탐지
-        roi_lane = lane_mask[y0:y1, :]
-        
-        # 수평 커널로 세로 차선 제거 (기울어진 정지선도 고려)
-        # 20도 기울기 대응: 약간 더 관대한 커널 사용
-        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 7))
-        stop_roi = cv2.morphologyEx(roi_lane, cv2.MORPH_OPEN, h_kernel)
-        stop_roi = cv2.morphologyEx(stop_roi, cv2.MORPH_CLOSE, h_kernel)
 
-        # 4. 정지선 컨투어 추출
-        contours, _ = cv2.findContours(stop_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        stop = "NONE"
-        stop_mask = None
-        area_thr = w * (y1 - y0) * self.stop_thr
-        width_thr = w * 0.4
+        stop, stop_mask, dbg_stop = self._detect_stopline_rowproj(bev, ymask, wmask, y0, y1)
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area <= area_thr:
-                continue
-                
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            
-            # 조건 체크 (기울어진 흰색 정지선 대응)
-            if bh == 0 or bw <= width_thr:
-                continue
-                
-            aspect_ratio = bw / float(bh)
-            # 20도 기울기: aspect_ratio ≈ 2.75, 여유값 2.0으로 완화
-            if aspect_ratio <= 2.0:
-                continue
-            
-            # 색상 판별 (ROI 슬라이싱 한 번만)
-            roi_y_slice = slice(y0 + y, y0 + y + bh)
-            roi_x_slice = slice(x, x + bw)
-            
-            ypx_cnt = cv2.countNonZero(ymask[roi_y_slice, roi_x_slice])
-            wpx_cnt = cv2.countNonZero(wmask[roi_y_slice, roi_x_slice])
-            
-            stop = "YELLOW" if ypx_cnt > wpx_cnt else "WHITE"
-            
-            stop_mask = np.zeros_like(lane_mask)
-            # 좌표 변환 없이 직접 ROI 좌표에 그리기
-            cv2.drawContours(stop_mask[y0:y1, :], [cnt], -1, 255, thickness=cv2.FILLED)
-            break
-
-        # 5. 디버깅용 ROI 픽셀 수 계산 (정지선 제거 전)
-        ypx_roi = cv2.countNonZero(ymask[y0:y1, :])
-        wpx_roi = cv2.countNonZero(wmask[y0:y1, :])
-        
-        # 6. 차선 정제 (정지선 제거)
-        clean_lane = lane_mask  # 이름 유지 (가독성)
+        # 3) Remove stopline region from lane mask (prevents polyfit corruption)
+        clean_lane = lane_mask.copy()
         if stop_mask is not None:
-            clean_lane = lane_mask & ~stop_mask  # 비트 연산으로 최적화
-        
-        # 상단 절단
+            clean_lane[stop_mask > 0] = 0
+
+        # 4) Crop top region for fitting stability (keep only nearer region)
         cut = int(self.lane_cut * h)
         clean_lane[cut:, :] = 0
-        
-        # 모폴로지 연산 (in-place)
-        kernel_3x3 = np.ones((3, 3), np.uint8)
-        cv2.morphologyEx(clean_lane, cv2.MORPH_CLOSE, kernel_3x3, dst=clean_lane)
 
-        # 7. 차선 피팅
-        lfit, rfit = self._fit(clean_lane)
-        
-        # 8. 디버깅 정보 생성
-        debug_bev = self._debug_line(bev, clean_lane, lfit, rfit, stop, ypx_roi, wpx_roi, stop)
-        
+        # 5) Fit lanes
+        lfit, rfit, debug_bev = self._fit(clean_lane)
+
+        # (optional) lightweight debug overlay
+        if debug_bev is not None:
+            cv2.rectangle(debug_bev, (0, y0), (w - 1, y1 - 1), (50, 200, 50), 1)
+            cv2.putText(
+                debug_bev,
+                f"STOP:{stop} score={dbg_stop['peak_norm']:.2f} cov={dbg_stop['cov']:.2f}",
+                (10, max(20, y0 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
         return lfit, rfit, stop, debug_bev
 
-    @staticmethod
     def _base(hist, lo, hi, fallback):
         lo, hi = max(0, int(lo)), min(len(hist), int(hi))
         if hi <= lo:

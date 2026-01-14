@@ -425,9 +425,8 @@ class DecisionNode:
         self.last_cmd_speed = self.cfg.speed_min
 
         rospy.loginfo("[Decision] System Ready.")
-        rospy.loginfo(f"[Decision] _topic={self.motor_topic}")
+        rospy.loginfo(f"[Decision] motor_topic={self.motor_topic}")
         rospy.loginfo(f"[Decision] lidar_road_width_m(half width)={self.cfg.lidar_road_width_m:.3f}m")
-motor
     # ------------------------- callbacks -------------------------
     def _cb_ar(self, msg: Float32MultiArray):
         if msg.data and len(msg.data) >= 3:

@@ -573,7 +573,7 @@ class CameraPerception:
             return
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         ar = cv2.aruco
-        dic = ar.getPredefinedDictionary(ar.DICT_4X4_1000)
+        dic = ar.getPredefinedDictionary(ar.DICT_5X5_1000)
         prm = ar.DetectorParameters()
         detector = ar.ArucoDetector(dic, prm)
         corners, ids, _ = detector.detectMarkers(gray)

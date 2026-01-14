@@ -28,6 +28,8 @@ import time
 import rospy
 import cv2
 import numpy as np
+import time
+from collections import deque, Counter
 
 from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import Float32MultiArray, String
@@ -35,6 +37,73 @@ from std_msgs.msg import Float32MultiArray, String
 
 def now_sec() -> float:
     return time.time()
+
+
+class _MajorityHysteresis:
+    """Majority vote with simple hysteresis + UNKNOWN clearing.
+
+    - Keeps last stable label unless a new label wins >= min_hits in the window.
+    - UNKNOWN does not directly override; it clears after consecutive UNKNOWNs.
+    """
+    def __init__(self, window: int, min_hits: int, unknown_clear: int, default: str = "UNKNOWN"):
+        self._buf = deque(maxlen=max(1, int(window)))
+        self._min_hits = max(1, int(min_hits))
+        self._unknown_clear = max(1, int(unknown_clear))
+        self._default = str(default)
+        self._stable = str(default)
+        self._unknown_run = 0
+
+    def update(self, raw: str) -> str:
+        raw = str(raw)
+        self._buf.append(raw)
+
+        if raw == "UNKNOWN":
+            self._unknown_run += 1
+        else:
+            self._unknown_run = 0
+
+        counts = Counter([x for x in self._buf if x != "UNKNOWN"])
+        if counts:
+            cand, hits = counts.most_common(1)[0]
+            if self._stable == self._default:
+                if hits >= self._min_hits:
+                    self._stable = cand
+            else:
+                if cand != self._stable and hits >= self._min_hits:
+                    self._stable = cand
+
+        if self._unknown_run >= self._unknown_clear:
+            self._stable = self._default
+
+        return self._stable
+
+
+class _StoplineDebouncer:
+    """Stopline debouncer with majority window + short hold time on hit."""
+    def __init__(self, window: int, min_hits: int, hold_sec: float):
+        self._buf = deque(maxlen=max(1, int(window)))
+        self._min_hits = max(1, int(min_hits))
+        self._hold_sec = max(0.0, float(hold_sec))
+        self._last = "NONE"
+        self._last_t = 0.0
+
+    def update(self, raw: str, t: float) -> str:
+        raw = str(raw)
+        self._buf.append(raw)
+
+        if raw != "NONE":
+            counts = Counter([x for x in self._buf if x != "NONE"])
+            if counts:
+                cand, hits = counts.most_common(1)[0]
+                if hits >= self._min_hits:
+                    self._last = cand
+                    self._last_t = float(t)
+                    return self._last
+
+        if self._last != "NONE" and (float(t) - float(self._last_t)) <= self._hold_sec:
+            return self._last
+
+        return "NONE"
 
 
 class CameraPerception:
@@ -85,6 +154,13 @@ class CameraPerception:
         self.last_fit = None
         self.last_fit_t = 0.0
 
+
+        # 단일 차선/갈림길 대비: 관측된 차선 폭(px) EMA
+        self._lane_width_px = float(rospy.get_param('~lane_width_default_px', 360.0))
+        self._lane_width_alpha = float(rospy.get_param('~lane_width_ema_alpha', 0.2))
+
+        # 검지 실패 시, 마지막 차선을 잠깐 유지하는 홀드 시간(초)
+        self._hold_lane_sec = float(rospy.get_param('~hold_lane_sec', 0.25))
         # ---------- mission state ----------
         self.mdir = "RIGHT"
         self.mstatus = "NONE"
@@ -96,6 +172,20 @@ class CameraPerception:
         self.GREEN  = (np.array([45, 100, 100]), np.array([90, 255, 255]))
         self.WHITE  = (np.array([0, 0, 200]),    np.array([179, 40, 255]))
 
+        # ---------- temporal filters ----------
+        self._tl_filter = _MajorityHysteresis(
+        window=rospy.get_param("~tl_window", 5),
+        min_hits=rospy.get_param("~tl_min_hits", 3),
+        unknown_clear=rospy.get_param("~tl_unknown_clear", 5),
+        default="UNKNOWN",
+        )
+        self._stop_filter = _StoplineDebouncer(
+        window=rospy.get_param("~stop_window", 5),
+        min_hits=rospy.get_param("~stop_min_hits", 2),
+        hold_sec=rospy.get_param("~stop_hold_sec", 0.30),
+        )
+
+
         # ---------- pubs ----------
         self.pub_lane = rospy.Publisher("/lane_coeffs", Float32MultiArray, queue_size=1)
         self.pub_stop = rospy.Publisher("/stop_line_status", String, queue_size=1)
@@ -104,7 +194,25 @@ class CameraPerception:
         self.pub_ov   = rospy.Publisher(self.overlay_topic, CompressedImage, queue_size=1)
 
         # ---------- subs ----------
-        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1)
+        # main.sh / launch에 따라 카메라 토픽이 달라질 수 있어 후보들을 모두 구독합니다.
+        # 첫 프레임이 들어온 토픽을 active로 고정하고 나머지는 무시합니다.
+        self._active_cam_topic = None
+        cam_topics = rospy.get_param("~camera_topics", [
+            self.cam_topic,
+            "camera/image_raw",
+            "/usb_cam/image_raw",
+            "/orda/usb_cam/image_raw",
+            "/camera/color/image_raw",
+            "/image_raw",
+        ])
+        self._cam_subs = []
+        for t in cam_topics:
+            if not t:
+                continue
+            try:
+                self._cam_subs.append(rospy.Subscriber(t, Image, lambda m, _t=t: self._on_img(m, _t), queue_size=1))
+            except Exception as e:
+                rospy.logwarn(f"[CameraPerception] Failed to subscribe {t}: {e}")
         rospy.Subscriber("/mission_direction", String, self._on_mission_direction, queue_size=1)
         rospy.Subscriber("/mission_status", String, self._on_mission_status, queue_size=1)
 
@@ -159,7 +267,13 @@ class CameraPerception:
         self.pub_ov.publish(m)
 
     # ---------------- main callback ----------------
-    def _on_img(self, msg: Image):
+    def _on_img(self, msg: Image, topic: str = ""):
+        if self._active_cam_topic is None:
+            self._active_cam_topic = topic or self.cam_topic
+            rospy.loginfo(f"[CameraPerception] Active camera topic: {self._active_cam_topic}")
+        elif topic and topic != self._active_cam_topic:
+            return
+
         frame = self._rosimg_to_bgr(msg)
         if frame is None:
             return
@@ -169,10 +283,11 @@ class CameraPerception:
         bev = cv2.warpPerspective(frame, self.M, (self.w, self.h))
 
         lfit, rfit, stop, debug_bev = self._lane_stop(bev)
-        self.pub_stop.publish(stop)
+        self.pub_stop.publish(self._stop_filter.update(stop, now_sec()))
 
         # 양쪽 차선 모두 검지
         if lfit is not None and rfit is not None:
+            self._update_lane_width(lfit, rfit)
             # 이미지 최하단
             y_bot = self.h - 1
             # 이미지 상단
@@ -187,36 +302,45 @@ class CameraPerception:
                 if w_top < w_bot:  # 상단으로 갈수록 너비가 좁아지는 경우 (수렴)
                     if self.mdir == "LEFT":
                         # 왼쪽으로 가야 하는데 왼쪽이 좁아지면, 확실한 오른쪽 선을 기준으로 주행
-                        self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+                        l_syn, r_syn = self._synthesize_pair_from_single(rfit)
+                        self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
                     else: # RIGHT 미션
                         # 오른쪽으로 가야 하는데 오른쪽이 좁아지면, 왼쪽 선을 기준으로 주행
-                        self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+                        l_syn, r_syn = self._synthesize_pair_from_single(lfit)
+                        self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
                 else:  # 상단으로 갈수록 너비가 넓어지는 경우 (발산/갈림길)
                     if self.mdir == "LEFT":
                         # 왼쪽 갈림길을 타기 위해 왼쪽 차선을 가이드로 선택
-                        self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+                        l_syn, r_syn = self._synthesize_pair_from_single(lfit)
+                        self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
                     else: # RIGHT 미션
                         # 오른쪽 갈림길을 타기 위해 오른쪽 차선을 가이드로 선택
-                        self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+                        l_syn, r_syn = self._synthesize_pair_from_single(rfit)
+                        self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
             # 정상적인 경우
             else :
                 self.last_fit, self.last_fit_t = (lfit, rfit), now_sec()
                 self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
         # 왼쪽만 검지
         elif lfit is not None:
-            self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+            l_syn, r_syn = self._synthesize_pair_from_single(lfit)
+            self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
         # 오른쪽만 검지
         elif rfit is not None:
-            self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
+            l_syn, r_syn = self._synthesize_pair_from_single(rfit)
+            self.pub_lane.publish(Float32MultiArray(data=list(l_syn) + list(r_syn)))
         # 둘 다 미검지 ** 이 부분은 나중에 판단 노드로 옮길 생각입니다
         else:
             if self.last_fit is not None and (now_sec() - self.last_fit_t) < self.hold_sec:
                 lfit_last, rfit_last = self.last_fit
                 self.pub_lane.publish(Float32MultiArray(data=list(lfit_last) + list(rfit_last)))
             else:
-                self.pub_lane.publish(Float32MultiArray(data=[]))
-            
-
+                # 검지 실패 시: 마지막 차선을 잠깐 유지 (주행 흔들림 감소)
+                if self.last_fit is not None and (now_sec() - float(self.last_fit_t)) <= float(self._hold_lane_sec):
+                    lfit, rfit = self.last_fit
+                    self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
+                else:
+                    self.pub_lane.publish(Float32MultiArray(data=[]))
         if self.mstatus == "STOP":
             debug_frame = self._traffic_light(frame, debug_frame)
             
@@ -230,60 +354,89 @@ class CameraPerception:
 
     # ---------------- algorithms (원본 로직 유지) ----------------
     def _lane_stop(self, bev):
-        # 1. 마스크 생성
+        h, w = bev.shape[:2]
         hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
 
+        # 1. 마스크 생성 (한 번만)
         ymask = cv2.inRange(hsv, *self.YELLOW)
         wmask = cv2.inRange(hsv, *self.WHITE)
+        lane_mask = cv2.bitwise_or(ymask, wmask)
         
-        h, w = ymask.shape
-        lane = cv2.bitwise_or(ymask, wmask) # 전체 차선 마스크
+        # 2. 정지선 ROI 설정
+        y0 = int(self.stop_y0 * h)
+        y1 = int(self.stop_y1 * h)
+        if y1 <= y0:
+            y1 = min(h, y0 + 1)
         
-        # 정지선 ROI 설정
-        y0, y1 = int(self.stop_y0 * h), int(self.stop_y1 * h)
-        if y1 <= y0: y1 = min(h, y0 + 1)
+        # 3. ROI 영역에서 정지선 탐지
+        roi_lane = lane_mask[y0:y1, :]
+        
+        # 수평 커널로 세로 차선 제거 (기울어진 정지선도 고려)
+        # 20도 기울기 대응: 약간 더 관대한 커널 사용
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 7))
+        stop_roi = cv2.morphologyEx(roi_lane, cv2.MORPH_OPEN, h_kernel)
+        stop_roi = cv2.morphologyEx(stop_roi, cv2.MORPH_CLOSE, h_kernel)
+
+        # 4. 정지선 컨투어 추출
+        contours, _ = cv2.findContours(stop_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         stop = "NONE"
-        stop_contour = None
+        stop_mask = None
+        area_thr = w * (y1 - y0) * self.stop_thr
+        width_thr = w * 0.4
 
-        # 2. 정지선 탐지 및 제거용 컨투어 추출
-        for mask, color_name in [(ymask, "YELLOW"), (wmask, "WHITE")]:
-            roi = mask[y0:y1, :]
-            contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area <= area_thr:
+                continue
+                
+            x, y, bw, bh = cv2.boundingRect(cnt)
             
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > (w * (y1 - y0) * self.stop_thr):
-                    rect = cv2.minAreaRect(cnt)
-                    (_, _), (lw, lh), angle = rect
-                    
-                    w_line = max(lw, lh)
-                    h_line = min(lw, lh)
-                    aspect_ratio = w_line / h_line if h_line > 0 else 0
-                    
-                    # 정지선 조건 (가로가 길고, 수직이 아님)
-                    if w_line > w * 0.4 and aspect_ratio > 2.0:
-                        stop = color_name
-                        stop_contour = cnt
-                        # ROI 좌표를 전체 이미지 좌표로 변환 (y0 더하기)
-                        stop_contour[:, :, 1] += y0 
-                        break
-            if stop != "NONE": break
+            # 조건 체크 (기울어진 흰색 정지선 대응)
+            if bh == 0 or bw <= width_thr:
+                continue
+                
+            aspect_ratio = bw / float(bh)
+            # 20도 기울기: aspect_ratio ≈ 2.75, 여유값 2.0으로 완화
+            if aspect_ratio <= 2.0:
+                continue
+            
+            # 색상 판별 (ROI 슬라이싱 한 번만)
+            roi_y_slice = slice(y0 + y, y0 + y + bh)
+            roi_x_slice = slice(x, x + bw)
+            
+            ypx_cnt = cv2.countNonZero(ymask[roi_y_slice, roi_x_slice])
+            wpx_cnt = cv2.countNonZero(wmask[roi_y_slice, roi_x_slice])
+            
+            stop = "YELLOW" if ypx_cnt > wpx_cnt else "WHITE"
+            
+            stop_mask = np.zeros_like(lane_mask)
+            # 좌표 변환 없이 직접 ROI 좌표에 그리기
+            cv2.drawContours(stop_mask[y0:y1, :], [cnt], -1, 255, thickness=cv2.FILLED)
+            break
 
-        if stop_contour is not None:
-            cv2.drawContours(lane, [stop_contour], -1, 0, thickness=cv2.FILLED)
-
-        # 4. 차선 피팅 (정지선이 제거된 lane 사용)
-        cut = int(self.lane_cut * h)
-        lane[cut:, :] = 0
-        lane = cv2.morphologyEx(lane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
-
-        lfit, rfit = self._fit(lane)
+        # 5. 디버깅용 ROI 픽셀 수 계산 (정지선 제거 전)
+        ypx_roi = cv2.countNonZero(ymask[y0:y1, :])
+        wpx_roi = cv2.countNonZero(wmask[y0:y1, :])
         
-        # 디버깅용 변수 계산 및 반환
-        ypx = cv2.countNonZero(ymask[y0:y1, :])
-        wpx = cv2.countNonZero(wmask[y0:y1, :])
-        debug_bev = self._debug_line(bev, lane, lfit, rfit, stop, ypx, wpx, stop)
+        # 6. 차선 정제 (정지선 제거)
+        clean_lane = lane_mask  # 이름 유지 (가독성)
+        if stop_mask is not None:
+            clean_lane = lane_mask & ~stop_mask  # 비트 연산으로 최적화
+        
+        # 상단 절단
+        cut = int(self.lane_cut * h)
+        clean_lane[cut:, :] = 0
+        
+        # 모폴로지 연산 (in-place)
+        kernel_3x3 = np.ones((3, 3), np.uint8)
+        cv2.morphologyEx(clean_lane, cv2.MORPH_CLOSE, kernel_3x3, dst=clean_lane)
+
+        # 7. 차선 피팅
+        lfit, rfit = self._fit(clean_lane)
+        
+        # 8. 디버깅 정보 생성
+        debug_bev = self._debug_line(bev, clean_lane, lfit, rfit, stop, ypx_roi, wpx_roi, stop)
         
         return lfit, rfit, stop, debug_bev
 
@@ -487,20 +640,26 @@ class CameraPerception:
             color = (0, 0, 255)
         cv2.rectangle(debug_frame, (min_w, min_h), (max_w, max_h) , color, thickness=3)
 
+    
+
     def _traffic_light(self, frame, debug_frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h, w = hsv.shape[:2]
         roi = hsv[0:int(h * 0.4), int(w * 0.2):int(w * 0.8)]
+
         red = cv2.countNonZero(cv2.bitwise_or(cv2.inRange(roi, *self.RED1), cv2.inRange(roi, *self.RED2)))
         yel = cv2.countNonZero(cv2.inRange(roi, *self.YELLOW))
         grn = cv2.countNonZero(cv2.inRange(roi, *self.GREEN))
+
         best = max((red, "RED"), (yel, "YELLOW"), (grn, "GREEN"))[1]
-        light_result = best if max(red, yel, grn) > 200 else "UNKNOWN"
-        self.pub_tl.publish(light_result)
+        raw = best if max(red, yel, grn) > 200 else "UNKNOWN"
+
+        stable = self._tl_filter.update(raw)
+        self.pub_tl.publish(stable)
 
         # ==============DEBUG==============
-        if light_result != "UNKNOWN":
-            self._debug_light(debug_frame, 0, int(h * 0.4), int(w * 0.2), int(w * 0.8), light_result)
+        if stable != "UNKNOWN":
+            self._debug_light(debug_frame, 0, int(h * 0.4), int(w * 0.2), int(w * 0.8), stable)
         return debug_frame
 
     def _ar_tag(self, frame, debug_frame):
@@ -534,9 +693,8 @@ class CameraPerception:
             self.pub_ar.publish(Float32MultiArray(data=out))
         return debug_frame
 
+
     def run(self):
         rospy.spin()
-
-
 if __name__ == "__main__":
     CameraPerception().run()

@@ -79,6 +79,9 @@ class MotorSerialConfig:
     neutral_steer: int = 90
     neutral_speed: int = 90
 
+    # 호환 옵션: speed=0을 '정지(중립 PWM)'로 간주
+    zero_speed_means_neutral: bool = True
+
     # 시리얼 연결 재시도
     open_retry_count: int = 50
     open_retry_sleep_sec: float = 0.1
@@ -120,6 +123,7 @@ class MotorSerialConfig:
 
         c.neutral_steer = int(rospy.get_param("~neutral_steer", c.neutral_steer))
         c.neutral_speed = int(rospy.get_param("~neutral_speed", c.neutral_speed))
+        c.zero_speed_means_neutral = bool(int(rospy.get_param("~zero_speed_means_neutral", int(c.zero_speed_means_neutral))))
 
         c.open_retry_count = int(rospy.get_param("~open_retry_count", c.open_retry_count))
         c.open_retry_sleep_sec = float(rospy.get_param("~open_retry_sleep_sec", c.open_retry_sleep_sec))
@@ -173,6 +177,10 @@ class MotorSerialBridge:
         d2 = 0
 
         steer = self._clamp(int(steer), self.cfg.steer_min, self.cfg.steer_max)
+        # speed 계약 호환: 다른 노드가 0을 보내면 중립 PWM으로 변환
+        if getattr(self.cfg, 'zero_speed_means_neutral', True) and int(speed) == 0:
+            speed = int(self.cfg.neutral_speed)
+
         speed = self._clamp(int(speed), self.cfg.speed_min, self.cfg.speed_max)
 
         # 체크섬 계산

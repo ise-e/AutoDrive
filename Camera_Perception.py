@@ -93,7 +93,7 @@ class CameraPerception:
         # ---------- HSV ranges ----------
         self.RED1 = (np.array([0, 100, 100]),   np.array([10, 255, 255]))
         self.RED2 = (np.array([160, 100, 100]), np.array([179, 255, 255]))
-        self.YELLOW = (np.array([15, 100, 100]), np.array([35, 255, 255]))
+        self.YELLOW = (np.array([10, 40, 50]), np.array([45, 255, 255]))
         self.GREEN  = (np.array([45, 100, 100]), np.array([90, 255, 255]))
         self.WHITE  = (np.array([0, 0, 200]),    np.array([179, 40, 255]))
 

@@ -149,15 +149,15 @@ class LegacyScenarioFSM:
                 self.state = self.DRIVE_RIGHT
                 self.is_stop = False
                 out = FsmOut(self.mission_direction, "NONE")
-                if prev_state != self.state:
-                    self._log_transition(prev_state, self.state, s, out)
-                return out
             elif light == "UNKNOWN":
                 self.is_stop = False
-                return FsmOut(self.mission_direction, "NONE")
+                out = FsmOut(self.mission_direction, "NONE")
             else:
                 self.is_stop = True
-                return FsmOut(self.mission_direction, "STOP")
+                out = FsmOut(self.mission_direction, "STOP")
+            if prev_state != self.state:
+                self._log_transition(prev_state, self.state, s, out)
+            return out
 
         if self.state == self.DRIVE_RIGHT:
             # WHITE 2회면 LEFT 주행으로

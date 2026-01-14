@@ -267,6 +267,53 @@ class CameraPerception:
         self.pub_ov.publish(m)
 
     # ---------------- main callback ----------------
+    def _update_lane_width(self, lfit, rfit) -> None:
+        """Update EMA of lane width in pixels using current left/right fits.
+
+        The fits are x(y) polynomials in BEV image coordinates.
+        """
+        try:
+            y_bot = self.h - 1
+            y_mid = int(self.h * 0.6)
+            y_top = int(self.h * 0.3)
+            widths = []
+            for y in (y_bot, y_mid, y_top):
+                lx = float(self._poly_x(lfit, y))
+                rx = float(self._poly_x(rfit, y))
+                w = rx - lx
+                if w > 0:
+                    widths.append(w)
+            if not widths:
+                return
+            w_new = float(np.median(widths))
+            # sanity: ignore nonsense measurements
+            if w_new < 60 or w_new > self.w * 1.5:
+                return
+            a = float(self._lane_width_alpha)
+            self._lane_width_px = (1.0 - a) * float(self._lane_width_px) + a * w_new
+        except Exception:
+            # keep running even if width update fails
+            return
+
+    def _synthesize_pair_from_single(self, fit_single):
+        """Given a single lane polynomial, synthesize the missing side using lane width EMA."""
+        if fit_single is None:
+            return None, None
+        a, b, c = float(fit_single[0]), float(fit_single[1]), float(fit_single[2])
+        y_ref = self.h - 1
+        x_ref = float(self._poly_x((a, b, c), y_ref))
+        delta = float(self._lane_width_px)
+        # decide side by x position at bottom
+        if x_ref < self.w * 0.5:
+            # treat as left lane => synth right by shifting +delta
+            lfit = np.array([a, b, c], dtype=np.float32)
+            rfit = np.array([a, b, c + delta], dtype=np.float32)
+        else:
+            # treat as right lane => synth left by shifting -delta
+            lfit = np.array([a, b, c - delta], dtype=np.float32)
+            rfit = np.array([a, b, c], dtype=np.float32)
+        return lfit, rfit
+
     def _on_img(self, msg: Image, topic: str = ""):
         if self._active_cam_topic is None:
             self._active_cam_topic = topic or self.cam_topic

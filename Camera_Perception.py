@@ -208,6 +208,28 @@ class CameraPerception:
         hold_sec=rospy.get_param("~stop_hold_sec", 0.30),
         )
 
+        # ---------- traffic light ROI & coupling with stopline ----------
+        # Base ROI (default): top tl_roi_y of the image, centered between [tl_roi_x0, tl_roi_x1]
+        self.tl_roi_y = float(rospy.get_param("~tl_roi_y", 0.40))
+        self.tl_roi_x0 = float(rospy.get_param("~tl_roi_x0", 0.20))
+        self.tl_roi_x1 = float(rospy.get_param("~tl_roi_x1", 0.80))
+        self.tl_pixel_thr = int(rospy.get_param("~tl_pixel_thr", 200))
+
+        # Expanded ROI when we are near an intersection/stopline (helps early acquisition)
+        self.tl_roi_y_expanded = float(rospy.get_param("~tl_roi_y_expanded", 0.60))
+        self.tl_roi_x0_expanded = float(rospy.get_param("~tl_roi_x0_expanded", 0.10))
+        self.tl_roi_x1_expanded = float(rospy.get_param("~tl_roi_x1_expanded", 0.90))
+        self.tl_pixel_thr_expanded = int(rospy.get_param("~tl_pixel_thr_expanded", 160))
+
+        # If stopline is strongly detected OR weakly suspected, keep "near_intersection" True for this duration.
+        self.near_intersection_hold_sec = float(rospy.get_param("~near_intersection_hold_sec", 1.5))
+
+        # Weak stopline thresholds (used only to expand TL ROI; does NOT directly trigger a STOP decision).
+        self.stop_row_score_weak_thr = float(rospy.get_param("~stop_row_score_weak_thr", 0.10))
+        self.stop_row_cov_weak_thr = float(rospy.get_param("~stop_row_cov_weak_thr", 0.20))
+
+        self._near_intersection_until = 0.0
+
         # ---------- fork (갈림길) 판단 파라미터 ----------
         # pdf 규칙:
         #  - WHITE 정지선 전: (노란 차선 1개 + 흰 차선 1개)로 갈림
@@ -442,8 +464,9 @@ class CameraPerception:
                     self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
                 else:
                     self.pub_lane.publish(Float32MultiArray(data=[]))
-        if self.mstatus == "STOP":
-            debug_frame = self._traffic_light(frame, debug_frame)
+        expanded_tl = self._near_intersection_active()
+        if self.mstatus == "STOP" or expanded_tl:
+            debug_frame = self._traffic_light(frame, debug_frame, expanded=expanded_tl)
             
         if self.mstatus == "PARKING":
             res = self._ar_tag(frame, debug_frame)
@@ -646,6 +669,16 @@ class CameraPerception:
             y1 = min(h, y0 + 1)
 
         stop, stop_mask, dbg_stop = self._detect_stopline_rowproj(bev, ymask, wmask, y0, y1)
+
+        # 2.5) Couple stopline <-> traffic light:
+        # If we see (or even weakly suspect) a stopline, temporarily expand TL ROI to avoid missing the light.
+        now_sec = rospy.Time.now().to_sec()
+        weak_near = (
+            float(dbg_stop.get("peak_norm", 0.0)) >= self.stop_row_score_weak_thr
+            and float(dbg_stop.get("cov", 0.0)) >= self.stop_row_cov_weak_thr
+        )
+        if stop != "NONE" or weak_near:
+            self._near_intersection_until = max(self._near_intersection_until, now_sec + self.near_intersection_hold_sec)
 
         # 3) Remove stopline region from lane mask (prevents polyfit corruption)
         clean_lane = lane_mask.copy()
@@ -888,24 +921,60 @@ class CameraPerception:
 
     
 
-    def _traffic_light(self, frame, debug_frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    def _near_intersection_active(self) -> bool:
+        try:
+            return rospy.Time.now().to_sec() <= float(getattr(self, "_near_intersection_until", 0.0))
+        except Exception:
+            return False
+
+    def _get_tl_roi(self, hsv, expanded: bool):
         h, w = hsv.shape[:2]
-        roi = hsv[0:int(h * 0.4), int(w * 0.2):int(w * 0.8)]
+
+        if expanded:
+            y_ratio = self.tl_roi_y_expanded
+            x0_ratio = self.tl_roi_x0_expanded
+            x1_ratio = self.tl_roi_x1_expanded
+        else:
+            y_ratio = self.tl_roi_y
+            x0_ratio = self.tl_roi_x0
+            x1_ratio = self.tl_roi_x1
+
+        # Clamp ratios
+        y_ratio = max(0.05, min(1.0, float(y_ratio)))
+        x0_ratio = max(0.0, min(1.0, float(x0_ratio)))
+        x1_ratio = max(0.0, min(1.0, float(x1_ratio)))
+        if x1_ratio <= x0_ratio:
+            x0_ratio, x1_ratio = 0.20, 0.80  # fallback
+
+        y1 = int(h * y_ratio)
+        x0 = int(w * x0_ratio)
+        x1 = int(w * x1_ratio)
+        y1 = max(1, min(h, y1))
+        x0 = max(0, min(w - 1, x0))
+        x1 = max(x0 + 1, min(w, x1))
+
+        roi = hsv[0:y1, x0:x1]
+        return roi, (0, y1, x0, x1)
+
+    def _traffic_light(self, frame, debug_frame, expanded: bool = False):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        roi, (y0, y1, x0, x1) = self._get_tl_roi(hsv, expanded)
 
         red = cv2.countNonZero(cv2.bitwise_or(cv2.inRange(roi, *self.RED1), cv2.inRange(roi, *self.RED2)))
         yel = cv2.countNonZero(cv2.inRange(roi, *self.YELLOW))
         grn = cv2.countNonZero(cv2.inRange(roi, *self.GREEN))
 
         best = max((red, "RED"), (yel, "YELLOW"), (grn, "GREEN"))[1]
-        raw = best if max(red, yel, grn) > 200 else "UNKNOWN"
+        thr = int(self.tl_pixel_thr_expanded if expanded else self.tl_pixel_thr)
 
+        raw = best if max(red, yel, grn) > thr else "UNKNOWN"
         stable = self._tl_filter.update(raw)
         self.pub_tl.publish(stable)
 
         # ==============DEBUG==============
         if stable != "UNKNOWN":
-            self._debug_light(debug_frame, 0, int(h * 0.4), int(w * 0.2), int(w * 0.8), stable)
+            self._debug_light(debug_frame, y0, y1, x0, x1, stable)
         return debug_frame
 
     def _ar_tag(self, frame, debug_frame):

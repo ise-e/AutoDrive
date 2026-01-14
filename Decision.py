@@ -86,6 +86,7 @@ class LegacyScenarioFSM:
 
         self.white_count = 0
         self.mission_direction = "RIGHT"
+        self.is_stop = False
 
         self._ts_white = 0.0
         self._ts_yellow = 0.0
@@ -141,20 +142,19 @@ class LegacyScenarioFSM:
 
         if self.state == self.YELLOW_STOP_1:
             # 노란선 감지: STOP, GREEN이면 출발
-            if stop == "YELLOW" and self._debounced(s.t, self._ts_yellow):
-                self._ts_yellow = s.t
+            if not self.is_stop and stop == "YELLOW":
+                self.is_stop = True
                 return FsmOut(self.mission_direction, "STOP")
-
-            if stop == "YELLOW":
-                if light == "GREEN":
-                    self.state = self.DRIVE_RIGHT
-                    out = FsmOut(self.mission_direction, "NONE")
-                    if prev_state != self.state:
-                        self._log_transition(prev_state, self.state, s, out)
-                    return out
-                return FsmOut(self.mission_direction, "STOP")
-
-            return FsmOut(self.mission_direction, "NONE")
+            elif light == "GREEN":
+                self.state = self.DRIVE_RIGHT
+                self.is_stop = False
+                out = FsmOut(self.mission_direction, "NONE")
+                if prev_state != self.state:
+                    self._log_transition(prev_state, self.state, s, out)
+                return out
+            else:
+                self.is_stop = False
+                return FsmOut(self.mission_direction, "NONE")
 
         if self.state == self.DRIVE_RIGHT:
             # WHITE 2회면 LEFT 주행으로
@@ -179,17 +179,21 @@ class LegacyScenarioFSM:
 
         if self.state == self.YELLOW_STOP_2:
             # 노란선 위에서는 STOP, GREEN이면 PARKING
-            if stop == "YELLOW":
-                if light == "GREEN":
-                    self.state = self.PARKING
-                    out = FsmOut(self.mission_direction, "PARKING")
-                    if prev_state != self.state:
-                        self._log_transition(prev_state, self.state, s, out)
-                    return out
+            if not self.is_stop and stop == "YELLOW":
+                self.is_stop = True
                 return FsmOut(self.mission_direction, "STOP")
-
-            # 노란선이 안 보이면 일단 NONE
-            return FsmOut(self.mission_direction, "NONE")
+            elif light == "GREEN":
+                self.is_stop = False
+                if s.ar is not None:
+                    self.state = self.PARKING
+                    return FsmOut(self.mission_direction, "PARKING")
+                out = FsmOut(self.mission_direction, "NONE")
+                if prev_state != self.state:
+                    self._log_transition(prev_state, self.state, s, out)
+                return out
+            else:
+                self.is_stop = False
+                return FsmOut(self.mission_direction, "NONE")
 
         if self.state == self.PARKING:
             # AR로 접근해서 dist <= park_stop_dist_m면 FINISH

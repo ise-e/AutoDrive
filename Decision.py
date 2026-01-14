@@ -184,22 +184,23 @@ class LegacyScenarioFSM:
             # 노란선 위에서는 STOP, GREEN이면 PARKING
             if not self.is_stop and stop == "YELLOW":
                 self.is_stop = True
-                return FsmOut(self.mission_direction, "STOP")
+                out = FsmOut(self.mission_direction, "STOP")
+            
             elif light == "GREEN":
                 self.is_stop = False
-                if s.ar is not None:
-                    self.state = self.PARKING
-                    return FsmOut(self.mission_direction, "PARKING")
+                self.state = self.PARKING
                 out = FsmOut(self.mission_direction, "NONE")
-                if prev_state != self.state:
-                    self._log_transition(prev_state, self.state, s, out)
-                return out
+            
             elif light == "UNKNOWN":
                 self.is_stop = False
-                return FsmOut(self.mission_direction, "NONE")
+                out = FsmOut(self.mission_direction, "NONE")
             else:
                 self.is_stop = True
-                return FsmOut(self.mission_direction, "STOP")
+                out = FsmOut(self.mission_direction, "STOP")
+            
+            if prev_state != self.state:
+                self._log_transition(prev_state, self.state, s, out)
+            return out
 
         if self.state == self.PARKING:
             # AR로 접근해서 dist <= park_stop_dist_m면 FINISH
@@ -208,11 +209,14 @@ class LegacyScenarioFSM:
                 if dist_m <= self.park_stop_dist_m:
                     self.state = self.FINISH
                     out = FsmOut(self.mission_direction, "FINISH")
-                    if prev_state != self.state:
-                        self._log_transition(prev_state, self.state, s, out)
-                    return out
-            return FsmOut(self.mission_direction, "PARKING")
-
+                else:
+                    out = FsmOut(self.mission_direction, "PARKING")
+            else:
+                out = FsmOut(self.mission_direction, "NONE")
+            
+            if prev_state != self.state:
+                self._log_transition(prev_state, self.state, s, out)
+            return out
         # FINISH
         return FsmOut(self.mission_direction, "FINISH")
 

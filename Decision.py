@@ -222,8 +222,8 @@ class DecisionNode:
         self.cfg = type("Cfg", (), {
             # steering / speed
             "cen": int(gp("steer_center", 90)),
-            "min": int(gp("steer_min", 45)),
-            "max": int(gp("steer_max", 135)),
+            "min": int(gp("steer_min", 48)), ## stable steer
+            "max": int(gp("steer_max", 132)),## stable steer
             "kp": float(gp("kp_steer", 200.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
             "kd": float(gp("kd_steer", 750)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
             "ki": float(gp("ki_steer", 0.0001)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
@@ -393,11 +393,11 @@ class DecisionNode:
             speed = 98
             err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
         elif s.lane:
-            y = int(self.cfg.h * 2/3) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+            y = int(self.cfg.h * 0.8) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w)/2.0)
             err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
-            THRESHOLD = 100
-            if abs(err_norm - self.prev_error) > THRESHOLD: err_norm = self.prev_error
+            THRESHOLD = 400
+            if abs(err_norm/self.cfg.meters_per_pixel_x - self.prev_error/self.cfg.meters_per_pixel_x) > THRESHOLD: err_norm = self.prev_error
         else:
             self.accum_error = 0.0
             self.prev_error = 0.0

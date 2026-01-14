@@ -84,6 +84,7 @@ class CameraPerception:
         self.hold_sec = float(get_param("~last_fit_hold_sec", 0.5))
         self.last_fit = None
         self.last_fit_t = 0.0
+        
 
         # ---------- mission state ----------
         self.mdir = "RIGHT"
@@ -103,8 +104,10 @@ class CameraPerception:
         self.pub_ar   = rospy.Publisher("/ar_tag_info", Float32MultiArray, queue_size=1)
         self.pub_ov   = rospy.Publisher(self.overlay_topic, CompressedImage, queue_size=1)
 
+        self.debug_timer = 0.0
+        self.debug_interval = 0.2
         # ---------- subs ----------
-        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1)
+        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1, buff_size=2**24)
         rospy.Subscriber("/mission_direction", String, self._on_mission_direction, queue_size=1)
         rospy.Subscriber("/mission_status", String, self._on_mission_status, queue_size=1)
 
@@ -149,6 +152,13 @@ class CameraPerception:
     def _publish_overlay(self, bgr):
         if not self.overlay_on:
             return
+        
+        now = now_sec()
+        if now - self.debug_timer < self.debug_interval:
+            return
+        
+        self.debug_timer = now
+
         ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpg_q])
         if not ok:
             return

@@ -71,9 +71,9 @@ class CameraPerception:
         self.minpts = int(get_param("~min_points", 220))
 
         # ---------- stopline ----------
-        self.stop_y0 = float(get_param("~stop_check_y0", 0.70))
-        self.stop_y1 = float(get_param("~stop_check_y1", 0.80))
-        self.stop_thr = float(get_param("~stop_px_per_col", 20.0))
+        self.stop_y0 = float(get_param("~stop_check_y0", 0.60))
+        self.stop_y1 = float(get_param("~stop_check_y1", 0.85))
+        self.stop_thr = float(get_param("~stop_px_per_col", 0.1))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
         # 정지선 검증을 위한 파라미터
@@ -269,7 +269,7 @@ class CameraPerception:
         stop = "NONE"
         stop_mask = None
         area_thr = w * (y1 - y0) * self.stop_thr
-        width_thr = w * 0.4
+        width_thr = w * 0.3
 
         for cnt in contours:
             area = cv2.contourArea(cnt)

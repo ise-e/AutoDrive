@@ -152,9 +152,12 @@ class LegacyScenarioFSM:
                 if prev_state != self.state:
                     self._log_transition(prev_state, self.state, s, out)
                 return out
-            else:
+            elif light == "UNKNOWN":
                 self.is_stop = False
                 return FsmOut(self.mission_direction, "NONE")
+            else:
+                self.is_stop = True
+                return FsmOut(self.mission_direction, "STOP")
 
         if self.state == self.DRIVE_RIGHT:
             # WHITE 2회면 LEFT 주행으로
@@ -191,9 +194,12 @@ class LegacyScenarioFSM:
                 if prev_state != self.state:
                     self._log_transition(prev_state, self.state, s, out)
                 return out
-            else:
+            elif light == "UNKNOWN":
                 self.is_stop = False
                 return FsmOut(self.mission_direction, "NONE")
+            else:
+                self.is_stop = True
+                return FsmOut(self.mission_direction, "STOP")
 
         if self.state == self.PARKING:
             # AR로 접근해서 dist <= park_stop_dist_m면 FINISH

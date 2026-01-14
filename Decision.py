@@ -407,7 +407,7 @@ class DecisionNode:
         self.mission = MissionManager(self.cfg)
 
         # 3) Publishers
-        self.motor_topic = rospy.get_param("~motor_topic", "/cmd/motor")
+        self.motor_topic = rospy.get_param("~motor_topic", "/motor")
         self.pub_motor = rospy.Publisher(self.motor_topic, Int16MultiArray, queue_size=1)
         self.pub_dir = rospy.Publisher("/mission_direction", String, queue_size=1)
         self.pub_status = rospy.Publisher("/mission_status", String, queue_size=1)
@@ -425,9 +425,9 @@ class DecisionNode:
         self.last_cmd_speed = self.cfg.speed_min
 
         rospy.loginfo("[Decision] System Ready.")
-        rospy.loginfo(f"[Decision] motor_topic={self.motor_topic}")
+        rospy.loginfo(f"[Decision] _topic={self.motor_topic}")
         rospy.loginfo(f"[Decision] lidar_road_width_m(half width)={self.cfg.lidar_road_width_m:.3f}m")
-
+motor
     # ------------------------- callbacks -------------------------
     def _cb_ar(self, msg: Float32MultiArray):
         if msg.data and len(msg.data) >= 3:

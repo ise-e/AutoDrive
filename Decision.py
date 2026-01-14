@@ -184,6 +184,7 @@ class LegacyScenarioFSM:
             # 노란선 위에서는 STOP, GREEN이면 PARKING
             if not self.is_stop and stop == "YELLOW":
                 self.is_stop = True
+                s.light = "UNKNOWN"
                 out = FsmOut(self.mission_direction, "STOP")
             
             elif light == "GREEN":

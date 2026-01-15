@@ -149,6 +149,16 @@ class CameraPerception:
         self.stop_line_angle_thr = float(get_param("~stop_line_angle_threshold", 20.0))  # 수평선 허용 각도
         self.stop_line_min_length = float(get_param("~stop_line_min_length", 100.0))  # 최소 선 길이
 
+        # ---------- stopline (row-projection + hough validation) ----------
+        # Strong thresholds: 실제 정지선 확정에 사용
+        self.stop_row_score_thr = float(get_param("~stop_row_score_thr", 0.30))
+        self.stop_row_cov_thr = float(get_param("~stop_row_cov_thr", 0.38))
+
+        # Hough 검증 파라미터: 수평선이 '진짜 선'인지 확인
+        self.stop_hough_threshold = int(get_param("~stop_hough_threshold", 70))
+        self.stop_hough_max_gap = int(get_param("~stop_hough_max_gap", 25))
+
+
         # ---------- dropout hold ----------
         self.hold_sec = float(get_param("~last_fit_hold_sec", 0.5))
         self.last_fit = None
@@ -220,6 +230,14 @@ class CameraPerception:
         self.tl_roi_x0_expanded = float(rospy.get_param("~tl_roi_x0_expanded", 0.10))
         self.tl_roi_x1_expanded = float(rospy.get_param("~tl_roi_x1_expanded", 0.90))
         self.tl_pixel_thr_expanded = int(rospy.get_param("~tl_pixel_thr_expanded", 160))
+
+        # ---------- traffic light (blob scoring) ----------
+        # ROI 내에서 '원형/밝은 덩어리'를 점수화해서 신호등을 더 안정적으로 인식합니다.
+        self.tl_blob_score_thr_ratio = float(get_param("~tl_blob_score_thr_ratio", 0.0025))
+        self.tl_blob_score_thr_ratio_expanded = float(get_param("~tl_blob_score_thr_ratio_expanded", 0.0012))
+        self.tl_blob_min_area_ratio = float(get_param("~tl_blob_min_area_ratio", 0.00015))
+        self.tl_blob_min_circularity = float(get_param("~tl_blob_min_circularity", 0.35))
+
 
         # If stopline is strongly detected OR weakly suspected, keep "near_intersection" True for this duration.
         self.near_intersection_hold_sec = float(rospy.get_param("~near_intersection_hold_sec", 1.5))
@@ -602,6 +620,33 @@ class CameraPerception:
         xr = float(self._poly_x(rfit, y_ref))
         return lfit if abs(x_target - xl) <= abs(x_target - xr) else rfit
 
+
+    def _hough_has_horizontal(self, edge_band: np.ndarray) -> bool:
+        """Return True if a sufficiently-long near-horizontal segment exists in edge_band."""
+        lines = cv2.HoughLinesP(
+            edge_band,
+            rho=1,
+            theta=np.pi / 180.0,
+            threshold=int(self.stop_hough_threshold),
+            minLineLength=int(self.stop_line_min_length),
+            maxLineGap=int(self.stop_hough_max_gap),
+        )
+        if lines is None:
+            return False
+
+        ang_thr = float(self.stop_line_angle_thr)  # degrees
+        for x1, y1, x2, y2 in lines[:, 0]:
+            dx = float(x2 - x1)
+            dy = float(y2 - y1)
+            length = float(np.hypot(dx, dy))
+            if length < float(self.stop_line_min_length):
+                continue
+            ang = abs(float(np.degrees(np.arctan2(dy, dx))))
+            ang = ang if ang <= 90.0 else 180.0 - ang
+            if ang <= ang_thr:
+                return True
+        return False
+
     def _detect_stopline_rowproj(self, bev_bgr, ymask, wmask, roi_y0, roi_y1):
         """Robust stopline detection using BEV + row projection of horizontal edge energy."""
         h, w = bev_bgr.shape[:2]
@@ -637,13 +682,19 @@ class CameraPerception:
         band_edge = edge[y_a:y_b, :]
         cov = float(np.count_nonzero(np.any(band_edge > 0, axis=0))) / float(w)
 
-        score_thr = float(rospy.get_param("~stop_row_score_thr", 0.18))
-        cov_thr = float(rospy.get_param("~stop_row_cov_thr", 0.35))
+        score_thr = float(self.stop_row_score_thr)
+        cov_thr = float(self.stop_row_cov_thr)
+
+        hough_ok = False
 
         stop = "NONE"
         stop_mask = None
 
         if peak_norm >= score_thr and cov >= cov_thr:
+            hough_ok = self._hough_has_horizontal(band_edge)
+            if not hough_ok:
+                dbg = {"peak_norm": peak_norm, "cov": cov, "thr": thr, "hough": False}
+                return "NONE", None, dbg
             yy0 = roi_y0 + y_a
             yy1 = roi_y0 + y_b
             ycnt = int(cv2.countNonZero(ymask[yy0:yy1, :]))
@@ -653,7 +704,7 @@ class CameraPerception:
             stop_mask = np.zeros((h, w), dtype=np.uint8)
             stop_mask[yy0:yy1, :] = 255
 
-        dbg = {"peak_norm": peak_norm, "cov": cov, "thr": thr}
+        dbg = {"peak_norm": peak_norm, "cov": cov, "thr": thr, "hough": bool(hough_ok)}
         return stop, stop_mask, dbg
 
     def _lane_stop(self, bev):
@@ -720,6 +771,7 @@ class CameraPerception:
         return lfit, rfit, stop, debug_bev
 
     @staticmethod
+
     def _base(hist, lo, hi, fallback):
         lo, hi = max(0, int(lo)), min(len(hist), int(hi))
         if hi <= lo:
@@ -759,7 +811,7 @@ class CameraPerception:
             gr = ((nzy >= ylo) & (nzy < yhi) & (nzx >= rlo) & (nzx < rhi)).nonzero()[0]
             lidx.append(gl)
             ridx.append(gr)
-            
+
             if len(gl) > self.minpix:
                 lx = int(np.mean(nzx[gl]))
             if len(gr) > self.minpix:
@@ -774,10 +826,10 @@ class CameraPerception:
         ANCHOR_WEIGHT = 30 
 
         l_fit_res, r_fit_res = None, None
-        
+
         try:
             li = np.concatenate(lidx) if lidx else np.array([], np.int32)
-            
+
             # [왼쪽 차선 피팅]
             if len(li) >= self.minpts:
                 # 1. 실제 검출된 점들
@@ -798,7 +850,7 @@ class CameraPerception:
                     l_fit_res = np.array([0.0, tmp_f[0], tmp_f[1]])
                 else:
                     l_fit_res = np.polyfit(final_y, final_x, 2)
-            
+
             # [오른쪽 차선 피팅]
             ri = np.concatenate(ridx) if ridx else np.array([], np.int32)
             if len(ri) >= self.minpts:
@@ -820,6 +872,7 @@ class CameraPerception:
         return l_fit_res, r_fit_res
 
     @staticmethod
+
     def _poly_x(f, y):
         return (f[0] * y * y) + (f[1] * y) + f[2]
 
@@ -841,7 +894,7 @@ class CameraPerception:
 
         # 2. 차선 시각화 (각각 독립적으로 수행)
         ptsL, ptsR = [], []
-        
+
         # Y좌표 생성 (이미지 하단 -> 상단)
         plot_y = np.linspace(h - 1, 0, h // 20).astype(int)
 
@@ -864,7 +917,7 @@ class CameraPerception:
                 else:
                     rf = base_lane
                     lf = (base_lane[0], base_lane[1], base_lane[2]-LINE_WIDTH_PX)
-        
+
         # (1) 왼쪽 차선 그리기
         if lf is not None:
             for y in plot_y:
@@ -905,10 +958,11 @@ class CameraPerception:
                     (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
         cv2.putText(debug_bev, f"Y:{ypx} W:{wpx}", (10, 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
-        
+
         return debug_bev
 
     # 신호등 탐지 시각화 함수
+
     def _debug_light(self, debug_frame, min_h, max_h, min_w, max_w, light):
         color = (0, 0, 0)
         if light == "GREEN":
@@ -919,9 +973,6 @@ class CameraPerception:
             color = (0, 0, 255)
         cv2.rectangle(debug_frame, (min_w, min_h), (max_w, max_h) , color, thickness=3)
 
-    
-
-    
     def _near_intersection_active(self) -> bool:
         try:
             return rospy.Time.now().to_sec() <= float(getattr(self, "_near_intersection_until", 0.0))
@@ -957,22 +1008,67 @@ class CameraPerception:
         roi = hsv[0:y1, x0:x1]
         return roi, (0, y1, x0, x1)
 
+    def _best_blob_score(self, mask: np.ndarray) -> float:
+        """Blob scoring: returns best score among candidate blobs in the binary mask."""
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        m = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
+
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return 0.0
+
+        H, W = m.shape[:2]
+        roi_area = float(H * W)
+        min_area = max(12.0, roi_area * float(self.tl_blob_min_area_ratio))
+        min_circ = float(self.tl_blob_min_circularity)
+
+        best = 0.0
+        for c in cnts:
+            area = float(cv2.contourArea(c))
+            if area < min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            ar = float(w) / float(h + 1e-6)
+            if ar < 0.4 or ar > 2.5:
+                continue
+            peri = float(cv2.arcLength(c, True))
+            if peri <= 1e-6:
+                continue
+            circ = 4.0 * np.pi * area / (peri * peri)
+            if circ < min_circ:
+                continue
+
+            score = area * (0.5 + circ)
+            if score > best:
+                best = score
+        return float(best)
+
     def _traffic_light(self, frame, debug_frame, expanded: bool = False):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         roi, (y0, y1, x0, x1) = self._get_tl_roi(hsv, expanded)
 
-        red = cv2.countNonZero(cv2.bitwise_or(cv2.inRange(roi, *self.RED1), cv2.inRange(roi, *self.RED2)))
-        yel = cv2.countNonZero(cv2.inRange(roi, *self.YELLOW))
-        grn = cv2.countNonZero(cv2.inRange(roi, *self.GREEN))
+        m_red = cv2.bitwise_or(cv2.inRange(roi, *self.RED1), cv2.inRange(roi, *self.RED2))
+        m_yel = cv2.inRange(roi, *self.YELLOW)
+        m_grn = cv2.inRange(roi, *self.GREEN)
 
-        best = max((red, "RED"), (yel, "YELLOW"), (grn, "GREEN"))[1]
-        thr = int(self.tl_pixel_thr_expanded if expanded else self.tl_pixel_thr)
+        s_red = self._best_blob_score(m_red)
+        s_yel = self._best_blob_score(m_yel)
+        s_grn = self._best_blob_score(m_grn)
 
-        raw = best if max(red, yel, grn) > thr else "UNKNOWN"
+        best_score, best_label = max((s_red, "RED"), (s_yel, "YELLOW"), (s_grn, "GREEN"))
+
+        # ROI 면적 기준 임계값(확장 ROI에서는 더 낮은 ratio 사용)
+        H, W = roi.shape[:2]
+        roi_area = float(H * W)
+        ratio = float(self.tl_blob_score_thr_ratio_expanded if expanded else self.tl_blob_score_thr_ratio)
+        default_thr = roi_area * ratio
+        score_thr = float(rospy.get_param("~tl_blob_score_thr", default_thr))
+
+        raw = best_label if best_score >= score_thr else "UNKNOWN"
         stable = self._tl_filter.update(raw)
         self.pub_tl.publish(stable)
 
-        # ==============DEBUG==============
         if stable != "UNKNOWN":
             self._debug_light(debug_frame, y0, y1, x0, x1, stable)
         return debug_frame
@@ -1008,8 +1104,8 @@ class CameraPerception:
             self.pub_ar.publish(Float32MultiArray(data=out))
         return debug_frame
 
-
     def run(self):
         rospy.spin()
+
 if __name__ == "__main__":
     CameraPerception().run()

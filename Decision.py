@@ -224,7 +224,6 @@ class DecisionNode:
 
         gp = lambda n, d: rospy.get_param("~" + n, d)
 
-        self.prev_
         self.accum_error = 0
         self.prev_error = 0
         self.prev_steer = None

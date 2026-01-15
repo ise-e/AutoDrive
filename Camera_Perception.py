@@ -270,7 +270,7 @@ class CameraPerception:
         stop = "NONE"
         stop_mask = None
         area_thr = w * (y1 - y0) * self.stop_thr
-        width_thr = w * 0.4
+        width_thr = w * 0.3
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -285,7 +285,7 @@ class CameraPerception:
                 
             aspect_ratio = bw / float(bh)
             # 20도 기울기: aspect_ratio ≈ 2.75, 여유값 2.0으로 완화
-            if aspect_ratio <= 2.0:
+            if aspect_ratio <= 3.0:
                 continue
             
             # 색상 판별 (ROI 슬라이싱 한 번만)

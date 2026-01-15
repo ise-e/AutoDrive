@@ -241,7 +241,7 @@ class DecisionNode:
             "min": int(gp("steer_min", 45)), ## stable steer
             "max": int(gp("steer_max", 135)),## stable steer
             "kp": float(gp("kp_steer", 45.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
-            "kd": float(gp("kd_steer", 15)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
+            "kd": float(gp("kd_steer", 15.0)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
             "ki": float(gp("ki_steer", 0.0001)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
             "spd_drive": int(gp("speed_drive", 100)),
             "spd_stop": int(gp("speed_stop", 90)),
@@ -494,10 +494,11 @@ class DecisionNode:
             err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
         elif s.lane:
             y = int(self.cfg.h * 0.7) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
-            half_w = max(1.0, float(self.cfg.w)/2.0)
-            err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
-            THRESHOLD = 300
-            if abs(err_norm/self.cfg.meters_per_pixel_x - self.prev_error/self.cfg.meters_per_pixel_x) > THRESHOLD: err_norm = self.prev_error
+            half_w = max(1.0, float(self.cfg.w) / 2.0)
+
+            # Legacy normalization: [-1.0, 1.0] error (ratio in image space)
+            # + : lane center is to the RIGHT of image center
+            err_norm = (s.lane.x_center(y) - half_w) / half_w
         else:
             self.accum_error = 0.0
             self.prev_error = 0.0
@@ -507,7 +508,7 @@ class DecisionNode:
         p_term = err_norm * float(self.cfg.kp)
         d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         i_term = self.accum_error * float(self.cfg.ki)
-        steer = self.cfg.cen - int(p_term + d_term + i_term)
+        steer = self.cfg.cen + int(p_term + d_term + i_term)
         self.prev_error = err_norm
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 

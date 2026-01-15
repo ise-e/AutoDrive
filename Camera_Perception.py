@@ -107,7 +107,7 @@ class CameraPerception:
         self.debug_timer = 0.0
         self.debug_interval = 0.2
         # ---------- subs ----------
-        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1, buff_size=2**24)
+        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1, buff_size=2**23)
         rospy.Subscriber("/mission_direction", String, self._on_mission_direction, queue_size=1)
         rospy.Subscriber("/mission_status", String, self._on_mission_status, queue_size=1)
 

@@ -202,11 +202,10 @@ class LegacyScenarioFSM:
                 dist_m = float(s.ar[0])
                 if dist_m <= self.park_stop_dist_m:
                     self.state = self.FINISH
-                    out = FsmOut(self.mission_direction, "FINISH")
-                else:
-                    out = FsmOut(self.mission_direction, "PARKING")
-            else:
-                out = FsmOut(self.mission_direction, "NONE")
+                    if prev_state != self.state:
+                        self._log_transition(prev_state, self.state, s, out)
+                    return FsmOut(self.mission_direction, "FINISH")
+            out = FsmOut(self.mission_direction, "PARKING")
             
             if prev_state != self.state:
                 self._log_transition(prev_state, self.state, s, out)

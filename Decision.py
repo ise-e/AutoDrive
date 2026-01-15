@@ -56,7 +56,7 @@ class Config:
     integ_reset_err: float = 0.02     # |err|가 이하면 I 리셋
 
     # 조향 부호(차량/서보 방향에 따라 뒤집힘). True면 조향 출력 부호를 반전
-    steer_invert: bool = False
+    steer_invert: bool = True
 
     # AR 태그 추종 조향 게인 (deg -> PWM 변환 스케일)
     ar_steer_gain: float = 1.0
@@ -276,6 +276,53 @@ class VehicleController:
 # ==============================================================================
 # 5. Mission FSM (Logic)
 # ==============================================================================
+
+class BasicMissionManager:
+    """
+    Mission FSM를 완전히 끈 '기본 주행 모드'용 매니저.
+    - direction: 고정(기본 RIGHT) 또는 파라미터로 설정
+    - status: 기본은 NONE
+    - 옵션: 정지선/신호등 기반으로 STOP만 만들어서 Decision에서 제동할 수 있게 함
+    """
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.direction = str(rospy.get_param("~default_direction", "RIGHT")).upper()
+        self._use_stop_traffic = bool(rospy.get_param("~use_stop_traffic_control", False))
+        self._min_stop_sec = float(rospy.get_param("~min_stop_sec", 0.8))
+        self._stop_until = 0.0
+        self._status = "NONE"
+
+    def update(self, s: WorldState) -> str:
+        now = float(s.timestamp)
+
+        if not self._use_stop_traffic:
+            self._status = "NONE"
+            return self._status
+
+        stop = getattr(s, "stop_sign", "NONE")
+        tl = getattr(s, "traffic_light", "UNKNOWN")
+
+        # 1) stopline을 보면 일단 최소 정지시간 확보
+        if stop in ("WHITE", "YELLOW"):
+            self._stop_until = max(self._stop_until, now + self._min_stop_sec)
+
+        # 2) 최소 정지시간이 남아있으면 STOP 유지
+        if now < self._stop_until:
+            self._status = "STOP"
+            return self._status
+
+        # 3) 정지선 근처에서 신호등이 RED/YELLOW면 STOP, GREEN이면 진행
+        if stop in ("WHITE", "YELLOW") and tl in ("RED", "YELLOW"):
+            self._status = "STOP"
+            return self._status
+
+        self._status = "NONE"
+        return self._status
+
+    def _status_str(self) -> str:
+        return str(self._status)
+
+
 class MissionState(Enum):
     START = auto()
     CHECK_STOP_1 = auto()    # 첫 상차구역 (Yellow)
@@ -410,7 +457,8 @@ class DecisionNode:
         # 2) Modules
         self.hub = SensorHub()
         self.ctrl = VehicleController(self.cfg)
-        self.mission = MissionManager(self.cfg)
+        self.mission_enable = bool(rospy.get_param("~mission_enable", False))
+        self.mission = MissionManager(self.cfg) if self.mission_enable else BasicMissionManager(self.cfg)
 
         # 3) Publishers
         self.motor_topic = rospy.get_param("~motor_topic", "/motor")
@@ -618,8 +666,9 @@ class DecisionNode:
 
     def _publish(self, steer: int, speed: int):
         self.pub_motor.publish(Int16MultiArray(data=[int(steer), int(speed)]))
-        self.pub_dir.publish(self.mission.direction)
-        self.pub_status.publish(self.mission._status_str())
+        self.pub_dir.publish(String(data=str(getattr(self.mission, "direction", "RIGHT")).upper()))
+        # MissionManager / BasicMissionManager 둘 다 _status_str() 제공
+        self.pub_status.publish(String(data=str(self.mission._status_str()).upper()))
 
 
 if __name__ == "__main__":

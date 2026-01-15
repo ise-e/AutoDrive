@@ -31,14 +31,14 @@ from std_msgs.msg import Int16MultiArray, String, Float32MultiArray
 class Config:
     # ---------------- 하드웨어 설정 ----------------
     steer_center: int = 90      # 조향 중앙값 (직진 PWM)
-    steer_min: int = 50         # 조향 최소값 (왼쪽 최대)
-    steer_max: int = 130        # 조향 최대값 (오른쪽 최대)
+    steer_min: int = 45         # 조향 최소값 (왼쪽 최대)
+    steer_max: int = 135        # 조향 최대값 (오른쪽 최대)
     
     # ---------------- 속도 설정 ----------------
     speed_drive: int = 100      # 평시 주행 속도
-    speed_caution: int = 95     # 코너링/라바콘 주행 속도
-    speed_parking: int = 98     # 주차 진입 속도
-    speed_min: int = 0          # 정지
+    speed_caution: int = 99     # 코너링/라바콘 주행 속도
+    speed_parking: int = 99     # 주차 진입 속도
+    speed_min: int = 90          # 정지
 
     # ---------------- 정지선 대기 크립(저속 전진) ----------------
     creep_enable: bool = True   # CHECK_STOP 구간에서 정지선 확정 전까지 저속 크립 주행
@@ -374,14 +374,14 @@ class DecisionNode:
         # 1) Config (ROS Param으로 덮어쓰기 가능)
         self.cfg = Config(
             steer_center=int(rospy.get_param("~steer_center", 90)),
-            steer_min=int(rospy.get_param("~steer_min", 50)),
-            steer_max=int(rospy.get_param("~steer_max", 130)),
+            steer_min=int(rospy.get_param("~steer_min", 45)),
+            steer_max=int(rospy.get_param("~steer_max", 135)),
             steer_invert=bool(rospy.get_param("~steer_invert", False)),
 
             speed_drive=int(rospy.get_param("~speed_drive", 100)),
-            speed_caution=int(rospy.get_param("~speed_caution", 95)),
-            speed_parking=int(rospy.get_param("~speed_parking", 98)),
-            speed_min=int(rospy.get_param("~speed_min", 0)),
+            speed_caution=int(rospy.get_param("~speed_caution", 99)),
+            speed_parking=int(rospy.get_param("~speed_parking", 99)),
+            speed_min=int(rospy.get_param("~speed_min", 90)),
 
             creep_enable=bool(rospy.get_param("~creep_enable", True)),
             speed_creep=int(rospy.get_param("~speed_creep", 99)),
@@ -533,7 +533,7 @@ class DecisionNode:
 
             if cam_age > self.cfg.watchdog_hard_sec and lidar_age > self.cfg.watchdog_hard_sec:
                 rospy.logwarn_throttle(1.0, "[Safety] Sensor Signal Lost! EMERGENCY STOP.")
-                self._publish(self.cfg.steer_center, 0)
+                self._publish(self.cfg.steer_center, 90)
                 rate.sleep()
                 continue
 
@@ -545,7 +545,7 @@ class DecisionNode:
             speed = self.cfg.speed_min
 
             if status == "FINISH":
-                steer, speed = self.cfg.steer_center, 0
+                steer, speed = self.cfg.steer_center, 90
 
             elif status == "STOP":
                 # 기본은 정지. 단, CHECK_STOP 구간에서는 정지선 확정 전까지 크립 주행 옵션.
@@ -555,9 +555,9 @@ class DecisionNode:
                         steer = self.ctrl.compute_steer(final_err, dt)
                         speed = int(self.cfg.speed_creep)
                     else:
-                        steer, speed = self.cfg.steer_center, 0
+                        steer, speed = self.cfg.steer_center, 90
                 else:
-                    steer, speed = self.cfg.steer_center, 0
+                    steer, speed = self.cfg.steer_center, 90
 
             elif status == "PARKING":
                 # AR 태그 추종 (+ 미검출 시 짧은 저속 탐색)
@@ -609,7 +609,7 @@ class DecisionNode:
                     if min(cam_age, lidar_age) < float(self.cfg.watchdog_soft_sec):
                         steer, speed = self.last_cmd_steer, self.last_cmd_speed
                     else:
-                        steer, speed = self.cfg.steer_center, 0
+                        steer, speed = self.cfg.steer_center, 90
 
             # 4) Actuation
             steer = self.ctrl._clamp(int(steer))

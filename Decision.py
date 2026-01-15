@@ -457,10 +457,16 @@ class DecisionNode:
                 return int(self.cfg.cen), max(int(self.cfg.speed_min_run), int(self.cfg.park_search_speed))
             return int(self.cfg.cen), int(self.cfg.spd_stop)
         """
+        steer, speed = self._drive_cmd(s)
+
         if s.ar is None:
-            steer, speed = self._drive_cmd(s)
             return int(steer), int(speed)
         else:
+            m_dist = s.ar[0]
+            if m_dist <= self.cfg.dist_p + 0.1:
+                return int(self.cfg.cen), int(self.cfg.spd_stop)
+            return int(steer), int(98)
+            """
             self._ts_ar_missing = 0.0
             dist_m, ang_rad = float(s.ar[0]), float(s.ar[1])
 
@@ -470,6 +476,7 @@ class DecisionNode:
             steer = int(self.cfg.cen + int(math.degrees(ang_rad)))
             steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
             return int(steer), max(int(self.cfg.speed_min_run), int(self.cfg.spd_parking))
+            """
 
     # ---------------- Publish ----------------
     def _publish(self, steer: int, speed: int, s: Snap, f: FsmOut) -> None:

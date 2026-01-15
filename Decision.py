@@ -222,6 +222,7 @@ class DecisionNode:
 
         gp = lambda n, d: rospy.get_param("~" + n, d)
 
+        self.prev_
         self.accum_error = 0
         self.prev_error = 0
         self.prev_steer = None
@@ -363,9 +364,11 @@ class DecisionNode:
         rate = rospy.Rate(30)
         while not rospy.is_shutdown():
             s = self._capture()
-
+            prev_fsm_state = self.fsm.state
             f = self.fsm.step(s)
 
+            if prev_fsm_state == self.fsm.YELLOW_STOP_1 and self.fsm.state == self.fsm.DRIVE_RIGHT:
+                self._up("light", "UNKNOWN")
             # compute cmd
             if f.mission_status == "PARKING":
                 steer, speed = self._parking_cmd(s)

@@ -71,8 +71,8 @@ class CameraPerception:
         self.minpts = int(get_param("~min_points", 220))
 
         # ---------- stopline ----------
-        self.stop_y0 = float(get_param("~stop_check_y0", 0.68))
-        self.stop_y1 = float(get_param("~stop_check_y1", 0.82))
+        self.stop_y0 = float(get_param("~stop_check_y0", 0.60))
+        self.stop_y1 = float(get_param("~stop_check_y1", 0.85))
         self.stop_thr = float(get_param("~stop_px_per_col", 0.2))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
@@ -93,7 +93,7 @@ class CameraPerception:
         # ---------- HSV ranges ----------
         self.RED1 = (np.array([0, 100, 100]),   np.array([10, 255, 255]))
         self.RED2 = (np.array([160, 100, 100]), np.array([179, 255, 255]))
-        self.YELLOW = (np.array([15, 70, 70]), np.array([40, 255, 255]))
+        self.YELLOW = (np.array([15, 80, 80]), np.array([40, 255, 255]))
         self.GREEN  = (np.array([45, 100, 100]), np.array([90, 255, 255]))
         self.WHITE  = (np.array([0, 0, 200]),    np.array([179, 40, 255]))
 
@@ -107,7 +107,7 @@ class CameraPerception:
         self.debug_timer = 0.0
         self.debug_interval = 0.2
         # ---------- subs ----------
-        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1, buff_size=2**23)
+        rospy.Subscriber(self.cam_topic, Image, self._on_img, queue_size=1, buff_size=2**24)
         rospy.Subscriber("/mission_direction", String, self._on_mission_direction, queue_size=1)
         rospy.Subscriber("/mission_status", String, self._on_mission_status, queue_size=1)
 

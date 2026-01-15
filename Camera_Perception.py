@@ -187,6 +187,8 @@ class CameraPerception:
             y_bot = self.h - 1
             # 이미지 상단
             y_top = int(self.h * 0.3)
+            # 이미지 제어 지점
+            y_eval = self.h * 0.8
             # 각 지점에서의 너비 계산
             w_bot = self._poly_x(rfit, y_bot) - self._poly_x(lfit, y_bot)
             w_top = self._poly_x(rfit, y_top) - self._poly_x(lfit, y_top)
@@ -194,19 +196,20 @@ class CameraPerception:
             width_deviation = abs(w_top - w_bot)
             # 차이가 60 이상일 경우 **값 조정 필요
             if width_deviation > 60 or w_top < 60:
-                if w_top < w_bot:  # 상단으로 갈수록 너비가 좁아지는 경우 (수렴)
-                    if self.mdir == "LEFT":
-                        # 왼쪽으로 가야 하는데 왼쪽이 좁아지면, 확실한 오른쪽 선을 기준으로 주행
+                get_deriv = lambda f, y: 2 * f[0] * y + f[1]
+                
+                deriv_l = get_deriv(lfit, y_eval)
+                deriv_r = get_deriv(rfit, y_eval)
+
+                if self.mdir == "LEFT":
+                    if (deriv_l - deriv_r) > 0 :
+                        self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
+                    else :
                         self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
-                    else: # RIGHT 미션
-                        # 오른쪽으로 가야 하는데 오른쪽이 좁아지면, 왼쪽 선을 기준으로 주행
+                else: # RIGHT 미션
+                    if (deriv_l - deriv_r) < 0 :
                         self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
-                else:  # 상단으로 갈수록 너비가 넓어지는 경우 (발산/갈림길)
-                    if self.mdir == "LEFT":
-                        # 왼쪽 갈림길을 타기 위해 왼쪽 차선을 가이드로 선택
-                        self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
-                    else: # RIGHT 미션
-                        # 오른쪽 갈림길을 타기 위해 오른쪽 차선을 가이드로 선택
+                    else :
                         self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
             # 정상적인 경우
             else :

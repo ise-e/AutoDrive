@@ -73,7 +73,7 @@ class CameraPerception:
         # ---------- stopline ----------
         self.stop_y0 = float(get_param("~stop_check_y0", 0.68))
         self.stop_y1 = float(get_param("~stop_check_y1", 0.82))
-        self.stop_thr = float(get_param("~stop_px_per_col", 20.0))
+        self.stop_thr = float(get_param("~stop_px_per_col", 0.2))
         self.lane_cut = float(get_param("~lane_fit_ymax", 0.70))
 
         # 정지선 검증을 위한 파라미터
@@ -417,7 +417,7 @@ class CameraPerception:
 
         # 가중치 (앵커 점을 몇 개나 추가할지) - 높을수록 고정력 강함
         # 차가 흔들릴 때 유연성을 주려면 10~20, 강력하게 고정하려면 50 이상
-        ANCHOR_WEIGHT = 10 
+        ANCHOR_WEIGHT = 20 
 
         l_fit_res, r_fit_res = None, None
         

@@ -5,10 +5,9 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 
 def start_node():
-    rospy.init_node('camera_node', anonymous=False)
+    rospy.init_node('img_publisher_node')
     # 카메라 이미지 토픽 발행
-    image_topic = rospy.get_param('~image_topic', 'camera/image_raw')
-    pub = rospy.Publisher(image_topic,  Image, queue_size=10)
+    pub = rospy.Publisher('camera/image_raw', Image, queue_size=10)
     
     bridge = CvBridge()
     rate = rospy.Rate(30) # 30Hz

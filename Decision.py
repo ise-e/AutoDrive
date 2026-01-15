@@ -2,673 +2,632 @@
 # -*- coding: utf-8 -*-
 
 """
-Decision.py
-[2026-01-04] Refactored for Stability & Safety
-
-주요 개선점:
-1. Thread-Safety: SensorHub를 통해 데이터 스냅샷(Snapshot) 사용 -> 센서 데이터 꼬임 방지
-2. Coordinate Normalization: 카메라(Pixel)와 라이다(Meter) 에러를 -1.0~1.0으로 통일
-3. Robust FSM: 상태 전이 로직을 분리하여 관리 (가독성 향상)
-4. Safety Watchdog: 센서 끊김 시 관성 주행(0.5s) 후 비상 정지(1.5s)
+DecisionNode
+- 개선된 I/O / PF 블렌드 / Lane RViz marker 구조는 유지
+- 상태머신만 "기존 대회 시나리오 FSM"으로 사용
+- ✅ FSM 로그 추가:
+  1) 상태 전이 로그: 전이 발생 시 1회 출력
+  2) 상태 유지 로그: 1Hz throttle로 현재 입력/출력/명령 출력
 """
 
 from __future__ import annotations
 
-import threading
-import time
 import math
+import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
-from enum import Enum, auto
+from typing import Optional, Tuple, Dict, Any, List
 
 import rospy
-from std_msgs.msg import Int16MultiArray, String, Float32MultiArray
+from std_msgs.msg import Int16MultiArray, String, Float32MultiArray, Float32
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 
-# ==============================================================================
-# 1. Configuration (튜닝 포인트 통합 관리)
-# ==============================================================================
+
+# ---------------- Data Structures ----------------
 @dataclass
-class Config:
-    # ---------------- 하드웨어 설정 ----------------
-    steer_center: int = 90      # 조향 중앙값 (직진 PWM)
-    steer_min: int = 45         # 조향 최소값 (왼쪽 최대)
-    steer_max: int = 135        # 조향 최대값 (오른쪽 최대)
-    
-    # ---------------- 속도 설정 ----------------
-    speed_drive: int = 100      # 평시 주행 속도
-    speed_caution: int = 99     # 코너링/라바콘 주행 속도
-    speed_parking: int = 99     # 주차 진입 속도
-    speed_min: int = 90          # 정지
+class Lane:
+    """차선 다항식 계수: [la, lb, lc, ra, rb, rc]"""
+    c: List[float]
 
-    # ---------------- 정지선 대기 크립(저속 전진) ----------------
-    creep_enable: bool = True   # CHECK_STOP 구간에서 정지선 확정 전까지 저속 크립 주행
-    speed_creep: int = 99       # 크립 주행 속도 (PWM)
-    creep_max_sec: float = 6.0  # 크립 최대 지속 시간 (초)
+    def x_center(self, y: float) -> float:
+        la, lb, lc, ra, rb, rc = self.c
+        lx = la * y * y + lb * y + lc
+        rx = ra * y * y + rb * y + rc
+        return 0.5 * (lx + rx)
 
-    # ---------------- PID 제어 (조향 감도) ----------------
-    kp: float = 120.0
-    ki: float = 0.05
-    kd: float = 250.0
-    
+    def x_poly(self, y: float, is_left: bool) -> float:
+        base = 0 if is_left else 3
+        return self.c[base] * y * y + self.c[base + 1] * y + self.c[base + 2]
 
-    # 적분(Integral) 안전장치
-    integ_limit: float = 0.25         # |I| 최대 (정규화 단위)
-    integ_reset_err: float = 0.02     # |err|가 이하면 I 리셋
-
-    # 조향 부호(차량/서보 방향에 따라 뒤집힘). True면 조향 출력 부호를 반전
-    steer_invert: bool = True
-
-    # AR 태그 추종 조향 게인 (deg -> PWM 변환 스케일)
-    ar_steer_gain: float = 1.0
-
-    # 센서 퓨전 신뢰도/신선도 파라미터
-    cam_ttl_sec: float = 1.0
-    lidar_ttl_sec: float = 0.25
-    cam_single_lane_weight: float = 0.65   # 3 coeffs일 때 신뢰도
-    cam_double_lane_weight: float = 1.00   # 6 coeffs일 때 신뢰도
-    lidar_double_lane_weight: float = 1.00 # 6 coeffs일 때 신뢰도
-    lidar_single_lane_weight: float = 0.25 # 한쪽만 보이면 보수적으로 반영
-
-    # 갈림길/단일차선에서 미션 방향으로 "약한 바이어스" (PWM 단위, 기본 0=OFF)
-    fork_bias_pwm: int = 0
-    # ---------------- 센서 파라미터 ----------------
-    # 카메라 (Pixel 단위)
-    cam_width: int = 640
-    cam_y_far: int = 150        # 원거리 점 (이미지 상단)
-    cam_y_near: int = 400       # 근거리 점 (이미지 하단)
-    w_cam_far: float = 0.6      # 원거리 가중치
-    w_cam_near: float = 0.4     # 근거리 가중치
-    
-    # 라이다 (Meter 단위)
-    lidar_road_width_m: float = 0.2  # 정규화를 위한 도로 반폭 기준 (m) : 차선폭 0.4m -> 반폭 0.2m  # 정규화를 위한 도로 반폭 기준 (m)
-    obs_eval_x: float = 0.5          # 라바콘 회피 판단 전방 거리 (m)
-
-    # ---------------- 안전 장치 ----------------
-    watchdog_soft_sec: float = 0.5   # 관성 주행 허용 시간
-    watchdog_hard_sec: float = 1.5   # 비상 정지 발동 시간
-    park_stop_dist: float = 0.3      # 주차 정지 거리 (m)
-    park_search_sec: float = 1.5     # AR 미검출 시 탐색 지속 시간 (s)
-    park_search_speed: int = 99    # AR 미검출 탐색 속도 (PWM)
-
-
-# ==============================================================================
-# 2. Data Structures (Immutable Snapshots)
-# ==============================================================================
-@dataclass(frozen=True)
-class CamLane:
-    coeffs: Tuple[float, ...]
-    timestamp: float
-
-    def get_error_norm(self, cfg: Config) -> float:
-        """
-        카메라 좌표계(Pixel) 에러를 -1.0(Left) ~ 1.0(Right) 범위로 정규화
-        수식: x = ay^2 + by + c
-        """
-        if not self.coeffs: return 0.0
-        
-        # Dual Lane (6 coeffs) or Single Lane (3 coeffs)
-        if len(self.coeffs) >= 6:
-            la, lb, lc, ra, rb, rc = self.coeffs[:6]
-            # 왼쪽/오른쪽 차선의 x좌표 계산
-            lx_far = la*cfg.cam_y_far**2 + lb*cfg.cam_y_far + lc
-            rx_far = ra*cfg.cam_y_far**2 + rb*cfg.cam_y_far + rc
-            cx_far = (lx_far + rx_far) / 2.0
-            
-            lx_near = la*cfg.cam_y_near**2 + lb*cfg.cam_y_near + lc
-            rx_near = ra*cfg.cam_y_near**2 + rb*cfg.cam_y_near + rc
-            cx_near = (lx_near + rx_near) / 2.0
-        else:
-            # Single Lane
-            a, b, c = self.coeffs[:3]
-            cx_far = a*cfg.cam_y_far**2 + b*cfg.cam_y_far + c
-            cx_near = a*cfg.cam_y_near**2 + b*cfg.cam_y_near + c
-
-        img_center = cfg.cam_width / 2.0
-        err_far = (cx_far - img_center)
-        err_near = (cx_near - img_center)
-        
-        # 픽셀 에러 가중 합산
-        err_pixel = (err_far * cfg.w_cam_far) + (err_near * cfg.w_cam_near)
-        
-        # 정규화 (도로 폭의 절반을 약 200px로 가정)
-        return max(-1.0, min(1.0, err_pixel / 140.0))
-
-@dataclass(frozen=True)
-class LidarLane:
-    coeffs: Tuple[float, ...]
-    timestamp: float
-
-    def get_error_norm(self, cfg: Config) -> float:
-        """
-        라이다 좌표계(Meter) 에러를 -1.0 ~ 1.0 범위로 정규화
-        수식: y = ax^2 + bx + c (차량 전방이 x축)
-        """
-        if not self.coeffs or len(self.coeffs) < 6: return 0.0
-        
-        # [La, Lb, Lc, Ra, Rb, Rc]
-        la, lb, lc = self.coeffs[:3]
-        ra, rb, rc = self.coeffs[3:6]
-        
-        eval_x = cfg.obs_eval_x
-        
-        # y coordinates (Lateral deviation)
-        ly = la*eval_x**2 + lb*eval_x + lc
-        ry = ra*eval_x**2 + rb*eval_x + rc
-        cy = (ly + ry) / 2.0
-        
-        # 정규화
-        return max(-1.0, min(1.0, cy / cfg.lidar_road_width_m))
 
 @dataclass
-class WorldState:
-    timestamp: float
-    cam: Optional[CamLane] = None
-    lidar: Optional[LidarLane] = None
-    stop_sign: str = "NONE"
-    traffic_light: str = "UNKNOWN"
-    ar_dist: Optional[float] = None
-    ar_angle: Optional[float] = None
+class Snap:
+    """루프 1회에서 사용하는 입력 스냅샷(원자적 캡처)"""
+    t: float
+    lane: Optional[Lane]
+    obs_lane: Optional[Lane]
+    stop: str
+    light: str
+    ar: Optional[Tuple[float, float]]   # (dist_m, ang_rad)
 
-# ==============================================================================
-# 3. Sensor Hub (Thread-Safe Manager)
-# ==============================================================================
-class SensorHub:
-    def __init__(self):
-        self._lock = threading.RLock()
-        self._cam: Optional[CamLane] = None
-        self._lidar: Optional[LidarLane] = None
-        self._stop = "NONE"
-        self._light = "UNKNOWN"
-        self._ar_dist = None
-        self._ar_angle = None
-        
-    def update_cam(self, data):
-        with self._lock:
-            self._cam = CamLane(tuple(data), time.time())
-    
-    def update_lidar(self, data):
-        with self._lock:
-            self._lidar = LidarLane(tuple(data), time.time())
+@dataclass
+class FsmOut:
+    """FSM 출력(카메라 노드와의 계약)"""
+    mission_direction: str   # "RIGHT" | "LEFT"
+    mission_status: str      # "NONE" | "STOP" | "PARKING" | "FINISH"
 
-    def update_stop(self, status):
-        with self._lock:
-            self._stop = (status or "NONE").upper()
 
-    def update_light(self, status):
-        with self._lock:
-            self._light = (status or "UNKNOWN").upper()
-
-    def update_ar(self, dist, angle):
-        with self._lock:
-            self._ar_dist = dist
-            self._ar_angle = angle
-
-    def get_snapshot(self) -> WorldState:
-        with self._lock:
-            return WorldState(
-                timestamp=time.time(),
-                cam=self._cam,
-                lidar=self._lidar,
-                stop_sign=self._stop,
-                traffic_light=self._light,
-                ar_dist=self._ar_dist,
-                ar_angle=self._ar_angle
-            )
-
-# ==============================================================================
-# 4. Vehicle Controller (PID & Actuation)
-# ==============================================================================
-class VehicleController:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.prev_err = 0.0
-        self.integ_err = 0.0
-        self.prev_output = 0.0  # Smoothing용
-
-    def compute_steer(self, error_norm: float, dt: float) -> int:
-        """
-        error_norm: -1.0 ~ 1.0
-        return: Steer PWM (절대값, 중앙값 포함)
-        """
-        if dt <= 0: dt = 0.033
-
-        # 1. PID Terms
-        p_term = error_norm * self.cfg.kp
-        
-        # Anti-Windup (I-term)
-        # 작은 오차 구간에서는 I를 빠르게 비워서 바이어스/드리프트를 줄입니다.
-        if abs(error_norm) <= self.cfg.integ_reset_err:
-            self.integ_err = 0.0
-        else:
-            self.integ_err += error_norm * dt
-            lim = float(self.cfg.integ_limit)
-            self.integ_err = max(-lim, min(lim, self.integ_err))
-        i_term = self.integ_err * self.cfg.ki
-        
-        d_term = ((error_norm - self.prev_err) / dt) * self.cfg.kd
-        
-        raw_output = p_term + i_term + d_term
-        
-        # 2. Output Smoothing (EMA Filter)
-        alpha = 0.6
-        smoothed_output = alpha * raw_output + (1 - alpha) * self.prev_output
-        
-        self.prev_err = error_norm
-        self.prev_output = smoothed_output
-        
-        # 3. Final Calculation
-        # 기본 규약: error_norm > 0 (우측 치우침) -> 좌회전 방향으로 보정
-        # 차량/서보 방향이 반대면 ~steer_invert:=1 로 뒤집어 주세요.
-        if self.cfg.steer_invert:
-            steer = self.cfg.steer_center + int(smoothed_output)
-        else:
-            steer = self.cfg.steer_center - int(smoothed_output)
-        return self._clamp(steer)
-
-    def _clamp(self, val: int) -> int:
-        return max(self.cfg.steer_min, min(self.cfg.steer_max, int(val)))
-        
-    def reset_pid(self):
-        self.prev_err = 0.0
-        self.integ_err = 0.0
-        self.prev_output = 0.0
-
-# ==============================================================================
-# 5. Mission FSM (Logic)
-# ==============================================================================
-
-class BasicMissionManager:
+# ---------------- 기존 시나리오 FSM ----------------
+class LegacyScenarioFSM:
     """
-    Mission FSM를 완전히 끈 '기본 주행 모드'용 매니저.
-    - direction: 고정(기본 RIGHT) 또는 파라미터로 설정
-    - status: 기본은 NONE
-    - 옵션: 정지선/신호등 기반으로 STOP만 만들어서 Decision에서 제동할 수 있게 함
-    """
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.direction = str(rospy.get_param("~default_direction", "RIGHT")).upper()
-        self._use_stop_traffic = bool(rospy.get_param("~use_stop_traffic_control", False))
-        self._min_stop_sec = float(rospy.get_param("~min_stop_sec", 0.8))
-        self._stop_until = 0.0
-        self._status = "NONE"
+    "기존 Decision(대회 시나리오) 상태머신" 구현 + 로그 포함
 
-    def update(self, s: WorldState) -> str:
-        now = float(s.timestamp)
-
-        if not self._use_stop_traffic:
-            self._status = "NONE"
-            return self._status
-
-        stop = getattr(s, "stop_sign", "NONE")
-        tl = getattr(s, "traffic_light", "UNKNOWN")
-
-        # 1) stopline을 보면 일단 최소 정지시간 확보
-        if stop in ("WHITE", "YELLOW"):
-            self._stop_until = max(self._stop_until, now + self._min_stop_sec)
-
-        # 2) 최소 정지시간이 남아있으면 STOP 유지
-        if now < self._stop_until:
-            self._status = "STOP"
-            return self._status
-
-        # 3) 정지선 근처에서 신호등이 RED/YELLOW면 STOP, GREEN이면 진행
-        if stop in ("WHITE", "YELLOW") and tl in ("RED", "YELLOW"):
-            self._status = "STOP"
-            return self._status
-
-        self._status = "NONE"
-        return self._status
-
-    def _status_str(self) -> str:
-        return str(self._status)
-
-
-class MissionState(Enum):
-    START = auto()
-    CHECK_STOP_1 = auto()    # 첫 상차구역 (Yellow)
-    DRIVE_1 = auto()         # 1바퀴째 주행 (우측통행)
-    DRIVE_2 = auto()         # 2바퀴째 주행 (좌측통행)
-    CHECK_STOP_2 = auto()    # 하차구역 (Yellow)
-    PARKING_SEARCH = auto()  # 주차구역 진입
-    PARKING_EXEC = auto()    # AR 태그 발견 및 주차
-    FINISH = auto()
-
-class MissionManager:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.state = MissionState.START
-        self.direction = "RIGHT" # 초기 우측통행
-        self.white_cnt = 0
-        self.last_state_change = time.time()
-        self.debounce_time = 2.0 # 상태 변경 후 2초간 중복 인식 방지
-
-    def update(self, s: WorldState) -> str:
-        now = s.timestamp
-        # Debounce 체크
-        if now - self.last_state_change < self.debounce_time:
-            return self._status_str()
-
-        # --- 상태 전이 로직 ---
-        if self.state == MissionState.START:
-            self._to(MissionState.CHECK_STOP_1, now)
-            
-        elif self.state == MissionState.CHECK_STOP_1:
-            # 노란선 정지 상태에서 초록불이면 출발
-            if s.stop_sign == "YELLOW" and s.traffic_light == "GREEN":
-                self._to(MissionState.DRIVE_1, now)
-        
-        elif self.state == MissionState.DRIVE_1:
-            # 흰색 정지선 카운트
-            if s.stop_sign == "WHITE":
-                self.white_cnt += 1
-                self.last_state_change = now # 카운트 중복 방지
-                rospy.loginfo(f"[FSM] White Line Count: {self.white_cnt}")
-                
-                # 2바퀴 돌았으면 좌측 통행(하차구역 진입) 준비
-                if self.white_cnt >= 2:
-                    self.direction = "LEFT"
-                    self._to(MissionState.DRIVE_2, now)
-        
-        elif self.state == MissionState.DRIVE_2:
-             # 좌측 주행 중 노란선 만나면 하차 구역
-             if s.stop_sign == "YELLOW":
-                 self._to(MissionState.CHECK_STOP_2, now)
-
-        elif self.state == MissionState.CHECK_STOP_2:
-            # 하차 완료(초록불) -> 주차 구역 이동
-            if s.stop_sign == "YELLOW" and s.traffic_light == "GREEN":
-                self._to(MissionState.PARKING_SEARCH, now)
-
-        elif self.state == MissionState.PARKING_SEARCH:
-            # AR 태그 발견 시 주차 실행 모드
-            if s.ar_dist is not None:
-                self._to(MissionState.PARKING_EXEC, now)
-
-        elif self.state == MissionState.PARKING_EXEC:
-            # 주차 거리 도달
-            if s.ar_dist is not None and s.ar_dist <= self.cfg.park_stop_dist: # Config 값 참조 필요
-                self._to(MissionState.FINISH, now)
-
-        return self._status_str()
-
-    def _to(self, new_state, now):
-        rospy.loginfo(f"[FSM] State Change: {self.state.name} -> {new_state.name}")
-        self.state = new_state
-        self.last_state_change = now
-
-    def _status_str(self):
-        if "CHECK_STOP" in self.state.name: return "STOP"
-        if "PARKING" in self.state.name: return "PARKING"
-        if self.state == MissionState.FINISH: return "FINISH"
-        return "NONE"
-
-# ==============================================================================
-# 6. Main Node
-# ==============================================================================
-
-class DecisionNode:
-    """
-    Decision Node (센서 퓨전 + 미션 FSM + 안전장치)
-    - 카메라/라이다 차선 오차를 -1~1로 정규화한 뒤 신선도/신뢰도 기반으로 퓨전
-    - 미션 상태(STOP/PARKING/FINISH/NONE)에 따라 제어 모드 전환
-    - 센서 끊김 시 Soft(관성) → Hard(비상정지) 단계적 대응
-    - CHECK_STOP 구간에서 정지선이 '확정(YELLOW)' 되기 전에는 저속 크립 주행 옵션
+    시나리오 요약:
+    - START -> YELLOW_STOP_1 -> DRIVE_RIGHT -> DRIVE_LEFT -> YELLOW_STOP_2 -> PARKING -> FINISH
+    - WHITE 2회 카운트 -> mission_direction = LEFT
+    - 1차 YELLOW: STOP 유지, GREEN이면 DRIVE_RIGHT로 전환
+    - 2차 YELLOW: STOP 유지, GREEN이면 PARKING으로 전환
+    - PARKING: AR dist <= park_stop_dist_m 이면 FINISH
     """
 
-    def __init__(self):
-        rospy.init_node("decision_node")
+    START = "START"
+    YELLOW_STOP_1 = "YELLOW_STOP_1"
+    DRIVE_RIGHT = "DRIVE_RIGHT"
+    DRIVE_LEFT = "DRIVE_LEFT"
+    YELLOW_STOP_2 = "YELLOW_STOP_2"
+    PARKING = "PARKING"
+    FINISH = "FINISH"
 
-        # 1) Config (ROS Param으로 덮어쓰기 가능)
-        self.cfg = Config(
-            steer_center=int(rospy.get_param("~steer_center", 90)),
-            steer_min=int(rospy.get_param("~steer_min", 45)),
-            steer_max=int(rospy.get_param("~steer_max", 135)),
-            steer_invert=bool(rospy.get_param("~steer_invert", False)),
+    def __init__(self, stopline_debounce_sec: float, park_stop_dist_m: float):
+        self.state = self.START
 
-            speed_drive=int(rospy.get_param("~speed_drive", 100)),
-            speed_caution=int(rospy.get_param("~speed_caution", 99)),
-            speed_parking=int(rospy.get_param("~speed_parking", 99)),
-            speed_min=int(rospy.get_param("~speed_min", 90)),
+        self.stopline_debounce_sec = float(stopline_debounce_sec)
+        self.park_stop_dist_m = float(park_stop_dist_m)
 
-            creep_enable=bool(rospy.get_param("~creep_enable", True)),
-            speed_creep=int(rospy.get_param("~speed_creep", 99)),
-            creep_max_sec=float(rospy.get_param("~creep_max_sec", 6.0)),
+        self.white_count = 0
+        self.mission_direction = "RIGHT"
+        self.is_stop = False
 
-            kp=float(rospy.get_param("~kp", 120.0)),
-            ki=float(rospy.get_param("~ki", 0.05)),
-            kd=float(rospy.get_param("~kd", 250.0)),
+        self._ts_white = 0.0
+        self._ts_yellow = 0.0
 
-            cam_ttl_sec=float(rospy.get_param("~cam_ttl_sec", 0.25)),
-            lidar_ttl_sec=float(rospy.get_param("~lidar_ttl_sec", 0.25)),
-            lidar_road_width_m=float(rospy.get_param("~lidar_road_width_m", 0.2)),
+        self._state_name = {
+            self.START: "START",
+            self.YELLOW_STOP_1: "YELLOW_STOP_1",
+            self.DRIVE_RIGHT: "DRIVE_RIGHT",
+            self.DRIVE_LEFT: "DRIVE_LEFT",
+            self.YELLOW_STOP_2: "YELLOW_STOP_2",
+            self.PARKING: "PARKING",
+            self.FINISH: "FINISH",
+        }
 
-            ar_steer_gain=float(rospy.get_param("~ar_steer_gain", 1.0)),
-            park_stop_dist=float(rospy.get_param("~park_stop_dist", 0.3)),
+    def _debounced(self, now_t: float, last_t: float) -> bool:
+        return (now_t - last_t) >= self.stopline_debounce_sec
 
-            park_search_sec=float(rospy.get_param("~park_search_sec", 1.5)),
-            park_search_speed=int(rospy.get_param("~park_search_speed", 99)),
-
-            fork_bias_pwm=int(rospy.get_param("~fork_bias_pwm", 0)),
-
-            watchdog_soft_sec=float(rospy.get_param("~watchdog_soft_sec", 0.5)),
-            watchdog_hard_sec=float(rospy.get_param("~watchdog_hard_sec", 1.5)),
+    def _log_transition(self, prev_state: str, new_state: str, s: Snap, out: FsmOut) -> None:
+        rospy.loginfo(
+            "[FSM] %s -> %s | stop=%s light=%s white=%d ar=%s | dir=%s status=%s",
+            self._state_name.get(prev_state, prev_state),
+            self._state_name.get(new_state, new_state),
+            (s.stop or "NONE"),
+            (s.light or "UNKNOWN"),
+            self.white_count,
+            ("None" if s.ar is None else f"{s.ar[0]:.2f}m,{math.degrees(s.ar[1]):.1f}deg"),
+            out.mission_direction,
+            out.mission_status,
         )
 
-        # 2) Modules
-        self.hub = SensorHub()
-        self.ctrl = VehicleController(self.cfg)
-        self.mission_enable = bool(rospy.get_param("~mission_enable", False))
-        self.mission = MissionManager(self.cfg) if self.mission_enable else BasicMissionManager(self.cfg)
+    def step(self, s: Snap) -> FsmOut:
+        prev_state = self.state
 
-        # 3) Publishers
-        self.motor_topic = rospy.get_param("~motor_topic", "/motor")
-        self.pub_motor = rospy.Publisher(self.motor_topic, Int16MultiArray, queue_size=1)
+        stop = (s.stop or "NONE").upper()
+        light = (s.light or "UNKNOWN").upper()
+
+        # --- WHITE 카운트(디바운스) ---
+        if stop == "WHITE" and self._debounced(s.t, self._ts_white):
+            self._ts_white = s.t
+            self.white_count += 1
+            rospy.loginfo("[FSM] WHITE++ -> %d", self.white_count)
+            if self.white_count >= 2:
+                self.mission_direction = "LEFT"
+
+        # --- 상태 전이 ---
+        if self.state == self.START:
+            # 시작 직후 1차 노란선 정지 상태로 진입
+            self.state = self.YELLOW_STOP_1
+            out = FsmOut(self.mission_direction, "NONE")
+            if prev_state != self.state:
+                self._log_transition(prev_state, self.state, s, out)
+            return out
+
+        if self.state == self.YELLOW_STOP_1:
+            # 노란선 감지: STOP, GREEN이면 출발
+            if stop == "YELLOW" and self._debounced(s.t, self._ts_yellow):
+                self._ts_yellow = s.t
+                self.is_stop = True
+                out = FsmOut(self.mission_direction, "STOP")
+            elif light == "GREEN":
+                self.state = self.DRIVE_RIGHT
+                self.is_stop = False
+                s.light = "UNKNOWN"
+                out = FsmOut(self.mission_direction, "NONE")
+            elif not self.is_stop:
+                out = FsmOut(self.mission_direction, "NONE")
+            else:
+                self.is_stop = True
+                out = FsmOut(self.mission_direction, "STOP")
+
+            if prev_state != self.state:
+                self._log_transition(prev_state, self.state, s, out)
+            return out
+
+        if self.state == self.DRIVE_RIGHT:
+            # WHITE 2회면 LEFT 주행으로
+            if self.white_count >= 2:
+                self.state = self.DRIVE_LEFT
+                out = FsmOut(self.mission_direction, "NONE")
+                if prev_state != self.state:
+                    self._log_transition(prev_state, self.state, s, out)
+                return out
+            return FsmOut(self.mission_direction, "NONE")
+
+        if self.state == self.DRIVE_LEFT:
+            # 2차 노란선 만나면 STOP2 진입
+            if stop == "YELLOW":
+                self.is_stop = True
+                self.state = self.YELLOW_STOP_2
+                out = FsmOut(self.mission_direction, "STOP")
+                if prev_state != self.state:
+                    self._log_transition(prev_state, self.state, s, out)
+                return out
+            return FsmOut(self.mission_direction, "NONE")
+
+        if self.state == self.YELLOW_STOP_2:
+            # 노란선 위에서는 STOP, GREEN이면 PARKING
+            if light == "GREEN":
+                self.is_stop = False
+                self.state = self.PARKING
+                out = FsmOut(self.mission_direction, "PARKING")
+            else:
+                self.is_stop = True
+                out = FsmOut(self.mission_direction, "STOP")
+            
+            if prev_state != self.state:
+                self._log_transition(prev_state, self.state, s, out)
+            return out
+
+        if self.state == self.PARKING:
+            # AR로 접근해서 dist <= park_stop_dist_m면 FINISH
+            if s.ar is not None:
+                dist_m = float(s.ar[0])
+                if dist_m <= self.park_stop_dist_m:
+                    self.state = self.FINISH
+                    out = FsmOut(self.mission_direction, "FINISH")
+                else:
+                    out = FsmOut(self.mission_direction, "PARKING")
+            else:
+                out = FsmOut(self.mission_direction, "NONE")
+            
+            if prev_state != self.state:
+                self._log_transition(prev_state, self.state, s, out)
+            return out
+        # FINISH
+        return FsmOut(self.mission_direction, "FINISH")
+
+
+# ---------------- Decision Node ----------------
+class DecisionNode:
+    def __init__(self):
+        rospy.init_node("decision_node")
+        
+        rospy.on_shutdown(self._on_shutdown)
+
+        gp = lambda n, d: rospy.get_param("~" + n, d)
+
+        self.accum_error = 0
+        self.prev_error = 0
+        self.prev_steer = None
+
+        # lane gate / ghost width tracking
+        self._last_lane_width_px = float(getattr(self.cfg, "lane_width_px_init", 342.0))
+        self._last_good_lane: Optional[Lane] = None
+        self._last_good_width_px: float = self._last_lane_width_px
+        self._last_good_t: float = 0.0
+        self._prev_cmd_steer: Optional[int] = None
+        # --- config ---
+        self.cfg = type("Cfg", (), {
+            # steering / speed
+            "cen": int(gp("steer_center", 90)),
+            "min": int(gp("steer_min", 48)), ## stable steer
+            "max": int(gp("steer_max", 132)),## stable steer
+            "kp": float(gp("kp_steer", 200.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
+            "kd": float(gp("kd_steer", 750)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
+            "ki": float(gp("ki_steer", 0.0001)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
+            "spd_drive": int(gp("speed_drive", 100)),
+            "spd_stop": int(gp("speed_stop", 90)),
+            "spd_parking": int(gp("speed_parking", 99)),
+
+            # run-speed floor (90~97은 정지로 해석되는 플랫폼 대응)
+            "speed_min_run": int(gp("speed_min_run", 99)),
+
+            # BEV geometry
+            "w": int(gp("bev_w", 640)),
+            "h": int(gp("bev_h", 480)),
+
+            # stopline / parking
+            "t_db": float(gp("stopline_debounce_sec", 1.0)),
+            "dist_p": float(gp("park_stop_dist_m", 0.3)),
+
+            # lane eval
+            "lane_eval_y": float(gp("lane_eval_y", -1.0)),
+            "obs_eval_x": float(gp("obs_eval_x", 0.5)),
+
+            # lane sanity gate (conservative safety net)
+            "lane_gate_enable": bool(gp("lane_gate_enable", True)),
+            "lane_width_px_init": float(gp("lane_width_px_init", 342.0)),  # ~0.4m baseline
+            "lane_width_min_px": float(gp("lane_width_min_px", 240.0)),
+            "lane_width_max_px": float(gp("lane_width_max_px", 445.0)),
+            "lane_width_jump_max_px": float(gp("lane_width_jump_max_px", 200.0)),
+            "lane_hold_sec": float(gp("lane_hold_sec", 0.3)),
+
+            # steer slew-rate clamp (deg-like PWM step per loop)
+            "steer_slew_enable": bool(gp("steer_slew_enable", True)),
+            "steer_slew_max_step": int(gp("steer_slew_max_step", 6)),
+
+            # parking search (AR 없을 때)
+            "park_search_sec": float(gp("park_search_sec", 1.0)),
+            "park_search_speed": int(gp("park_search_speed", 98)),
+
+            # viz
+            "base_frame": str(gp("base_frame", "base_link")),
+            "meters_per_pixel_x": float(gp("meters_per_pixel_x", 9.0703e-4)), # w의 3분의 1일 때
+            "meters_per_pixel_y": float(gp("meters_per_pixel_y", 0.01)),
+            "lane_marker_enable": bool(gp("lane_marker_enable", True)),
+            "lane_marker_topic": str(gp("lane_marker_topic", "/viz/lanes")),
+            "lane_marker_width": float(gp("lane_marker_width", 0.02)),
+            "lane_marker_lifetime": float(gp("lane_marker_lifetime", 0.2)),
+            "lane_sample_step_px": int(gp("lane_sample_step_px", 40)),
+        })()
+
+        # --- FSM ---
+        self.fsm = LegacyScenarioFSM(
+            stopline_debounce_sec=self.cfg.t_db,
+            park_stop_dist_m=self.cfg.dist_p
+        )
+
+        # --- input cache ---
+        self.lock = threading.RLock()
+        self._d: Dict[str, Any] = {
+            "lane": None,
+            "obs_lane": None,
+            "stop": "NONE",
+            "light": "UNKNOWN",
+            "ar": None,
+        }
+
+        # --- publishers ---
+        self.pub_motor = rospy.Publisher("/motor", Int16MultiArray, queue_size=1)
         self.pub_dir = rospy.Publisher("/mission_direction", String, queue_size=1)
         self.pub_status = rospy.Publisher("/mission_status", String, queue_size=1)
 
-        # 4) Subscribers
-        rospy.Subscriber("/lane_coeffs", Float32MultiArray, lambda m: self.hub.update_cam(m.data))
-        rospy.Subscriber("/obs_lane_coeffs", Float32MultiArray, lambda m: self.hub.update_lidar(m.data))
-        rospy.Subscriber("/stop_line_status", String, lambda m: self.hub.update_stop(m.data))
-        rospy.Subscriber("/traffic_light_status", String, lambda m: self.hub.update_light(m.data))
-        rospy.Subscriber("/ar_tag_info", Float32MultiArray, self._cb_ar)
+        self.pub_viz = None
+        if self.cfg.lane_marker_enable and self.cfg.lane_marker_topic:
+            self.pub_viz = rospy.Publisher(self.cfg.lane_marker_topic, MarkerArray, queue_size=1)
 
-        # 5) Loop/Command cache
-        self.last_loop_time = time.time()
-        self.last_cmd_steer = self.cfg.steer_center
-        self.last_cmd_speed = self.cfg.speed_min
+        # --- subscribers ---
+        rospy.Subscriber("/lane_coeffs", Float32MultiArray, self._cb_lane, queue_size=1)
+        rospy.Subscriber("/obs_lane_coeffs", Float32MultiArray, self._cb_obs_lane, queue_size=1)
+        rospy.Subscriber("/stop_line_status", String, lambda m: self._up("stop", (m.data or "NONE").upper()), queue_size=1)
+        rospy.Subscriber("/traffic_light_status", String, lambda m: self._up("light", (m.data or "UNKNOWN").upper()), queue_size=1)
+        rospy.Subscriber("/ar_tag_info", Float32MultiArray, self._cb_ar, queue_size=1)
 
-        rospy.loginfo("[Decision] System Ready.")
-        rospy.loginfo(f"[Decision] motor_topic={self.motor_topic}")
-        rospy.loginfo(f"[Decision] lidar_road_width_m(half width)={self.cfg.lidar_road_width_m:.3f}m")
-    # ------------------------- callbacks -------------------------
-    def _cb_ar(self, msg: Float32MultiArray):
-        if msg.data and len(msg.data) >= 3:
-            # msg.data = [id, dist, ang]
-            self.hub.update_ar(float(msg.data[1]), float(msg.data[2]))
+        self._ts_ar_missing = 0.0
 
-    # ------------------------- fusion helpers -------------------------
-    @staticmethod
-    def _fresh_weight(age_sec: float, ttl_sec: float) -> float:
-        if age_sec < 0 or ttl_sec <= 1e-6:
-            return 0.0
-        return max(0.0, min(1.0, 1.0 - (age_sec / ttl_sec)))
+        rospy.loginfo("[Decision] Legacy FSM + FSM logs enabled.")
 
-    @staticmethod
-    def _lane_reliability(coeffs, single_w: float, double_w: float) -> float:
-        if coeffs is None:
-            return 0.0
-        n = len(coeffs)
+    def _on_shutdown(self) -> None:
+        rospy.loginfo("[Decision] Node is shutting down. Safety stop initiated.")
+        
+        msg = Int16MultiArray(data=[int(90), int(90)])
+        
+        # 반복적으로 몇 번 더 보내주면 더 확실하게 멈춥니다.
+        rate = rospy.Rate(10)
+        for _ in range(3):
+            if not rospy.is_shutdown(): # 셧다운 중에도 발행 가능한지 확인
+                self.pub_motor.publish(msg)
+            rospy.sleep(0.1)
+
+    # ---------------- Cache update ----------------
+    def _up(self, key: str, val: Any, tkey: Optional[str] = None) -> None:
+        now = rospy.get_time()
+        with self.lock:
+            self._d[key] = val
+            if tkey:
+                self._d[tkey] = now
+
+    
+    def _cb_lane(self, m: Float32MultiArray) -> None:
+        data = list(m.data) if m.data else []
+        n = len(data)
+
+        # evaluation point near bottom for robust width estimation
+        y_eval = int(self.cfg.h * 0.8)
+        center_x = float(self.cfg.w) * 0.5
+
+        width_px = float(getattr(self, "_last_lane_width_px", float(self.cfg.lane_width_px_init)))
+
+        lane: Optional[Lane] = None
+
         if n >= 6:
-            return float(double_w)
-        if n >= 3:
-            return float(single_w)
-        return 0.0
+            lane = Lane(data)
+            # update width estimate when both sides are available
+            try:
+                w = self._lane_width_px(lane, y_eval)
+                # 넉넉한 범위에서만 업데이트(대회 직전 보수적)
+                if 150.0 <= w <= 600.0:
+                    self._last_lane_width_px = float(w)
+            except Exception:
+                pass
 
-    def _compute_fused_error(self, s: WorldState, now: float) -> Tuple[float, bool, float, float]:
-        """
-        return: (final_err, valid, cam_age, lidar_age)
-        """
-        cam_err = s.cam.get_error_norm(self.cfg) if s.cam else 0.0
-        lidar_err = s.lidar.get_error_norm(self.cfg) if s.lidar else 0.0
+        elif n >= 3:
+            a, b, c = float(data[0]), float(data[1]), float(data[2])
+            target_x = a * (y_eval ** 2) + b * y_eval + c
 
-        cam_age = (now - s.cam.timestamp) if s.cam else 1e9
-        lidar_age = (now - s.lidar.timestamp) if s.lidar else 1e9
+            # 감지된 곡선이 오른쪽/왼쪽 중 어디로 더 가까운지로 판별 (320 하드코딩 제거)
+            if target_x > center_x:  # right lane curve
+                lane = Lane([a, b, c - width_px, a, b, c])
+            else:  # left lane curve
+                lane = Lane([a, b, c, a, b, c + width_px])
 
-        cam_f = self._fresh_weight(cam_age, float(self.cfg.cam_ttl_sec))
-        lidar_f = self._fresh_weight(lidar_age, float(self.cfg.lidar_ttl_sec))
+        self._up("lane", lane)
 
-        cam_r = self._lane_reliability(
-            getattr(s.cam, "coeffs", None) if s.cam else None,
-            self.cfg.cam_single_lane_weight,
-            self.cfg.cam_double_lane_weight,
-        )
-        lidar_r = self._lane_reliability(
-            getattr(s.lidar, "coeffs", None) if s.lidar else None,
-            self.cfg.lidar_single_lane_weight,
-            self.cfg.lidar_double_lane_weight,
-        )
+    def _cb_obs_lane(self, m: Float32MultiArray) -> None:
+        data = list(m.data) if len(m.data) else []
+        if len(data):
+            obs_lane = Lane(data)
+        else:
+            obs_lane = None
+        self._up("obs_lane", obs_lane)
 
-        w_cam = cam_r * cam_f
-        w_lidar = lidar_r * lidar_f
-        w_sum = w_cam + w_lidar
-        if w_sum <= 1e-6:
-            return 0.0, False, cam_age, lidar_age
+    def _cb_ar(self, m: Float32MultiArray) -> None:
+        # format: [id, dist, ang(rad)]
+        ar = (float(m.data[1]), float(m.data[2])) if (m.data and len(m.data) >= 3) else None
+        self._up("ar", (ar[0], ar[1]) if ar else None)
 
-        final_err = (w_cam * cam_err + w_lidar * lidar_err) / w_sum
-        return final_err, True, cam_age, lidar_age
+    def _capture(self) -> Snap:
+        t = rospy.get_time()
+        with self.lock:
+            return Snap(
+                t=t,
+                lane=self._d["lane"],
+                obs_lane=self._d["obs_lane"],
+                stop=self._d["stop"],
+                light=self._d["light"],
+                ar=self._d["ar"],
+            )
 
-    # ------------------------- creep logic -------------------------
-    def _stop_wait_creep_allowed(self, s: WorldState, now: float) -> bool:
-        """
-        CHECK_STOP 구간에서 '정지선 확정(YELLOW)'이 아직 안 된 동안만 저속 크립 주행.
-        - 너무 오래 크립하면 정지
-        - 차선 센서가 최소 하나라도 살아있어야 허용
-        """
-        if not bool(self.cfg.creep_enable):
-            return False
+    # ---------------- Lane filtering (conservative safety net) ----------------
+    @staticmethod
+    def _lane_width_px(lane: Lane, y_px: float) -> float:
+        try:
+            lx = lane.x_poly(float(y_px), True)
+            rx = lane.x_poly(float(y_px), False)
+            return float(rx - lx)
+        except Exception:
+            return float("nan")
 
-        st_name = getattr(self.mission.state, "name", "")
-        if "CHECK_STOP" not in st_name:
-            return False
+    def _filter_lane_for_drive(self, lane: Optional[Lane], now_t: float) -> Optional[Lane]:
+        """Return a lane suitable for control. If current is suspicious, fall back to last good."""
+        if lane is None or not bool(getattr(self.cfg, "lane_gate_enable", True)):
+            # allow None, but still use last good within hold window if enabled
+            if bool(getattr(self.cfg, "lane_gate_enable", True)) and self._last_good_lane is not None:
+                if (now_t - self._last_good_t) <= float(self.cfg.lane_hold_sec):
+                    return self._last_good_lane
+            return lane
 
-        if getattr(s, "stop_sign", "NONE") == "YELLOW":
-            return False
+        y_eval = int(self.cfg.h * 0.8)  # stable evaluation point
+        w = self._lane_width_px(lane, y_eval)
 
-        enter_t = float(getattr(self.mission, "last_state_change", now))
-        if (now - enter_t) > float(self.cfg.creep_max_sec):
-            return False
+        wmin = float(self.cfg.lane_width_min_px)
+        wmax = float(self.cfg.lane_width_max_px)
+        wjump = float(self.cfg.lane_width_jump_max_px)
 
-        cam_ok = (s.cam is not None) and (len(getattr(s.cam, "coeffs", []) or []) >= 3)
-        lidar_ok = (s.lidar is not None) and (len(getattr(s.lidar, "coeffs", []) or []) >= 3)
-        return cam_ok or lidar_ok
+        ok = (w == w) and (wmin <= w <= wmax) and (abs(w - float(self._last_good_width_px)) <= wjump)
 
-    # ------------------------- main loop -------------------------
-    def run(self):
-        rate = rospy.Rate(30)  # 30Hz
+        if ok:
+            self._last_good_lane = lane
+            self._last_good_width_px = w
+            self._last_good_t = now_t
+            return lane
+
+        # suspicious frame -> fall back to last good if fresh
+        if self._last_good_lane is not None and (now_t - self._last_good_t) <= float(self.cfg.lane_hold_sec):
+            return self._last_good_lane
+
+        return None
+
+    # ---------------- Main loop ----------------
+    def run(self) -> None:
+        rate = rospy.Rate(30)
         while not rospy.is_shutdown():
-            now = time.time()
-            dt = now - self.last_loop_time
-            self.last_loop_time = now
-            if dt <= 0:
-                dt = 1.0 / 30.0
+            s = self._capture()
+            # conservative lane filter: block sudden lane-width glitches
+            s.lane = self._filter_lane_for_drive(s.lane, s.t)
+            prev_fsm_state = self.fsm.state
+            f = self.fsm.step(s)
 
-            s = self.hub.get_snapshot()
-
-            # 1) Safety Watchdog
-            cam_age = now - (s.cam.timestamp if s.cam else 0.0)
-            lidar_age = now - (s.lidar.timestamp if s.lidar else 0.0)
-
-            if cam_age > self.cfg.watchdog_hard_sec and lidar_age > self.cfg.watchdog_hard_sec:
-                rospy.logwarn_throttle(1.0, "[Safety] Sensor Signal Lost! EMERGENCY STOP.")
-                self._publish(self.cfg.steer_center, 90)
-                rate.sleep()
-                continue
-
-            # 2) Mission FSM
-            status = self.mission.update(s)
-
-            # 3) Control
-            steer = self.cfg.steer_center
-            speed = self.cfg.speed_min
-
-            if status == "FINISH":
-                steer, speed = self.cfg.steer_center, 90
-
-            elif status == "STOP":
-                # 기본은 정지. 단, CHECK_STOP 구간에서는 정지선 확정 전까지 크립 주행 옵션.
-                if self._stop_wait_creep_allowed(s, now):
-                    final_err, valid, *_ = self._compute_fused_error(s, now)
-                    if valid:
-                        steer = self.ctrl.compute_steer(final_err, dt)
-                        speed = int(self.cfg.speed_creep)
-                    else:
-                        steer, speed = self.cfg.steer_center, 90
-                else:
-                    steer, speed = self.cfg.steer_center, 90
-
-            elif status == "PARKING":
-                # AR 태그 추종 (+ 미검출 시 짧은 저속 탐색)
-                if s.ar_dist is not None and s.ar_angle is not None:
-                    # AR이 보이면: 정밀 추종
-                    self._park_no_ar_start = None
-                    angle_deg = math.degrees(float(s.ar_angle))
-                    if self.cfg.steer_invert:
-                        angle_deg = -angle_deg
-                    steer = self.ctrl._clamp(self.cfg.steer_center + int(self.cfg.ar_steer_gain * angle_deg))
-                    speed = int(self.cfg.speed_parking)
-                else:
-                    # AR이 안 보이면: 1~2초 정도 직진 탐색(크립) 후 정지
-                    if self._park_no_ar_start is None:
-                        self._park_no_ar_start = now
-
-                    if float(now - self._park_no_ar_start) <= float(self.cfg.park_search_sec):
-                        steer = self.cfg.steer_center
-                        speed = int(self.cfg.park_search_speed)
-                    else:
-                        steer = self.cfg.steer_center
-                        speed = int(self.cfg.speed_min)
-
+            if prev_fsm_state == self.fsm.YELLOW_STOP_1 and self.fsm.state == self.fsm.DRIVE_RIGHT:
+                self._up("light", "UNKNOWN")
+            # compute cmd
+            if f.mission_status == "PARKING":
+                steer, speed = self._parking_cmd(s)
+            elif f.mission_status in ("STOP", "FINISH"):
+                steer, speed = self.cfg.cen, self.cfg.spd_stop
             else:
-                # 일반 주행: 센서 퓨전 + Soft Fallback
-                final_err, valid, cam_age, lidar_age = self._compute_fused_error(s, now)
+                steer, speed = self._drive_cmd(s)
 
-                if valid:
-                    steer = self.ctrl.compute_steer(final_err, dt)
+            # ✅ 상태 유지 로그 (1Hz)
+            rospy.loginfo_throttle(
+                1.0,
+                "[FSM] state=%s white=%d stop=%s light=%s ar=%s | dir=%s status=%s | cmd=(%d,%d)",
+                self.fsm.state,
+                self.fsm.white_count,
+                (s.stop or "NONE"),
+                (s.light or "UNKNOWN"),
+                ("None" if s.ar is None else f"{s.ar[0]:.2f}m,{math.degrees(s.ar[1]):.1f}deg"),
+                f.mission_direction,
+                f.mission_status,
+                int(steer), int(speed),
+            )
 
-                    # 갈림길/단일차선에서 미션 방향 바이어스 (기본 0=OFF)
-                    if int(self.cfg.fork_bias_pwm) != 0:
-                        cam_n = len(getattr(s.cam, "coeffs", []) or []) if s.cam else 0
-                        lidar_n = len(getattr(s.lidar, "coeffs", []) or []) if s.lidar else 0
-                        if cam_n == 3 and lidar_n < 6:
-                            bias = int(self.cfg.fork_bias_pwm)
-                            if str(self.mission.direction).upper() == "LEFT":
-                                bias = -bias
-                            if self.cfg.steer_invert:
-                                bias = -bias
-                            steer = self.ctrl._clamp(steer + bias)
-
-                    steer_dev = abs(int(steer) - int(self.cfg.steer_center))
-                    speed = int(self.cfg.speed_caution if steer_dev > 25 else self.cfg.speed_drive)
-
-                    self.last_cmd_steer, self.last_cmd_speed = int(steer), int(speed)
-                else:
-                    # Soft: 최근까지 신선했다면 이전 명령 유지 (급정지/튐 방지)
-                    if min(cam_age, lidar_age) < float(self.cfg.watchdog_soft_sec):
-                        steer, speed = self.last_cmd_steer, self.last_cmd_speed
-                    else:
-                        steer, speed = self.cfg.steer_center, 90
-
-            # 4) Actuation
-            steer = self.ctrl._clamp(int(steer))
-            self._publish(steer, int(speed))
+            self._publish(steer, speed, s, f)
             rate.sleep()
 
-    def _publish(self, steer: int, speed: int):
-        self.pub_motor.publish(Int16MultiArray(data=[int(steer), int(speed)]))
-        self.pub_dir.publish(String(data=str(getattr(self.mission, "direction", "RIGHT")).upper()))
-        # MissionManager / BasicMissionManager 둘 다 _status_str() 제공
-        self.pub_status.publish(String(data=str(self.mission._status_str()).upper()))
+    # ---------------- Command computation ----------------
+    def _drive_cmd(self, s: Snap) -> Tuple[int, int]:
+        steer = int(self.cfg.cen)
+        speed = int(self.cfg.spd_drive)
+
+        # 1) Lane -> steer
+        if s.obs_lane:
+            speed = 98
+            err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
+        elif s.lane:
+            y = int(self.cfg.h * 0.7) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+            half_w = max(1.0, float(self.cfg.w)/2.0)
+            err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
+            THRESHOLD = 300
+            if abs(err_norm/self.cfg.meters_per_pixel_x - self.prev_error/self.cfg.meters_per_pixel_x) > THRESHOLD: err_norm = self.prev_error
+        else:
+            self.accum_error = 0.0
+            self.prev_error = 0.0
+            return int(self.cfg.cen), max(int(speed), int(self.cfg.speed_min_run))
+
+        self.accum_error += err_norm
+        p_term = err_norm * float(self.cfg.kp)
+        d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
+        i_term = self.accum_error * float(self.cfg.ki)
+        steer = self.cfg.cen - int(p_term + d_term + i_term)
+        self.prev_error = err_norm
+        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+
+        target_steer = self.cfg.cen - int(p_term + d_term + i_term)
+
+        if self.prev_steer:
+            alpha = 0.0  ## 현재 kd와 기능이 겹쳐 비활성화, 추후 제거
+            steer = int(alpha * self.prev_steer + (1 - alpha) * target_steer)
+
+        self.prev_steer = steer
+        steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+
+        # 90~97은 정지로 해석되는 경우가 있어, 주행 중에는 최소 속도를 보장
+        speed = max(int(speed), int(self.cfg.speed_min_run))
+        return int(steer), int(speed)
+
+    def _parking_cmd(self, s: Snap) -> Tuple[int, int]:
+        # AR 없으면 잠깐 천천히 탐색 -> 그래도 없으면 정지
+        """
+        if s.ar is None:
+            if self._ts_ar_missing <= 0.0:
+                self._ts_ar_missing = s.t
+            if (s.t - self._ts_ar_missing) <= float(self.cfg.park_search_sec):
+                return int(self.cfg.cen), max(int(self.cfg.speed_min_run), int(self.cfg.park_search_speed))
+            return int(self.cfg.cen), int(self.cfg.spd_stop)
+        """
+        if s.ar is None:
+            steer, speed = self._drive_cmd(s)
+            return int(steer), int(speed)
+        else:
+            self._ts_ar_missing = 0.0
+            dist_m, ang_rad = float(s.ar[0]), float(s.ar[1])
+
+            if dist_m <= float(self.cfg.dist_p):
+                return int(self.cfg.cen), int(self.cfg.spd_stop)
+
+            steer = int(self.cfg.cen + int(math.degrees(ang_rad)))
+            steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
+            return int(steer), max(int(self.cfg.speed_min_run), int(self.cfg.spd_parking))
+
+    # ---------------- Publish ----------------
+    def _publish(self, steer: int, speed: int, s: Snap, f: FsmOut) -> None:
+        steer = self._clamp_i(int(steer), self.cfg.min, self.cfg.max)
+        # conservative slew-rate clamp to prevent one-frame spikes
+        if bool(getattr(self.cfg, "steer_slew_enable", True)):
+            max_step = int(getattr(self.cfg, "steer_slew_max_step", 0))
+            if max_step > 0 and self._prev_cmd_steer is not None:
+                d = int(steer) - int(self._prev_cmd_steer)
+                if d > max_step:
+                    steer = int(self._prev_cmd_steer) + max_step
+                elif d < -max_step:
+                    steer = int(self._prev_cmd_steer) - max_step
+        self._prev_cmd_steer = int(steer)
+
+        speed = int(speed)
+
+        # motor
+        self.pub_motor.publish(Int16MultiArray(data=[steer, speed]))
+
+        # mission topics (Camera_Perception 연동)
+        self.pub_dir.publish(f.mission_direction)
+        # FINISH는 외부에서 STOP처럼 다루는 경우가 많아 STOP으로 내보냄
+        self.pub_status.publish("STOP" if f.mission_status == "FINISH" else f.mission_status)
+
+        # viz
+        if self.pub_viz and s.lane:
+            try:
+                self._viz_lane(s.lane)
+            except Exception as e:
+                rospy.logwarn_throttle(1.0, f"[Decision] lane marker publish failed: {e}")
+
+    # ---------------- Viz ----------------
+    def _px_to_base(self, x_px: float, y_px: float) -> Tuple[float, float]:
+        cx = float(self.cfg.w) * 0.5
+        forward_m = (float(self.cfg.h) - float(y_px)) * float(self.cfg.meters_per_pixel_y)
+        left_m = -(float(x_px) - cx) * float(self.cfg.meters_per_pixel_x)
+        return float(forward_m), float(left_m)
+
+    def _line_marker(self, ns: str, mid: int, pts_xy, rgb) -> Marker:
+        m = Marker()
+        m.header.stamp = rospy.Time.now()
+        m.header.frame_id = self.cfg.base_frame
+        m.ns, m.id = ns, int(mid)
+        m.type, m.action = Marker.LINE_STRIP, Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x = float(self.cfg.lane_marker_width)
+        m.color.r, m.color.g, m.color.b, m.color.a = float(rgb[0]), float(rgb[1]), float(rgb[2]), 0.9
+        m.lifetime = rospy.Duration(float(self.cfg.lane_marker_lifetime))
+        for x, y in pts_xy:
+            m.points.append(Point(x=float(x), y=float(y), z=0.05))
+        return m
+
+    def _viz_lane(self, lane: Lane) -> None:
+        step = max(1, int(self.cfg.lane_sample_step_px))
+        left_pts, right_pts, center_pts = [], [], []
+
+        for y in range(int(self.cfg.h) - 1, -1, -step):
+            y_f = float(y)
+            lx = lane.x_poly(y_f, True)
+            rx = lane.x_poly(y_f, False)
+            cx = 0.5 * (lx + rx)
+            left_pts.append(self._px_to_base(lx, y_f))
+            right_pts.append(self._px_to_base(rx, y_f))
+            center_pts.append(self._px_to_base(cx, y_f))
+
+        if len(center_pts) < 2:
+            return
+
+        ma = MarkerArray()
+        ma.markers = [
+            self._line_marker("lane_left", 0, left_pts, (0.2, 0.6, 1.0)),
+            self._line_marker("lane_right", 1, right_pts, (1.0, 0.6, 0.2)),
+            self._line_marker("lane_center", 2, center_pts, (0.3, 1.0, 0.3)),
+        ]
+        self.pub_viz.publish(ma)
+
+    # ---------------- utils ----------------
+    @staticmethod
+    def _clamp_i(v: int, low: int, high: int) -> int:
+        return max(int(low), min(int(high), int(v)))
 
 
 if __name__ == "__main__":

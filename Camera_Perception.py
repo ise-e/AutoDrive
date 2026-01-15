@@ -116,7 +116,7 @@ class CameraPerception:
         self.w, self.h = int(get_param("~out_w", 640)), int(get_param("~out_h", 480))
 
         self.overlay_topic = get_param("~overlay_topic", "/debug/lane_overlay/image/compressed")
-        self.overlay_on = bool(get_param("~overlay_enable", True))
+        self.overlay_on = bool(get_param("~overlay_enable", False))
         self.jpg_q = int(get_param("~jpeg_quality", 80))
 
         # ---------- BEV ----------

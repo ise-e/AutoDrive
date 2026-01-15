@@ -62,7 +62,7 @@ class Config:
     ar_steer_gain: float = 1.0
 
     # 센서 퓨전 신뢰도/신선도 파라미터
-    cam_ttl_sec: float = 0.25
+    cam_ttl_sec: float = 1.0
     lidar_ttl_sec: float = 0.25
     cam_single_lane_weight: float = 0.65   # 3 coeffs일 때 신뢰도
     cam_double_lane_weight: float = 1.00   # 6 coeffs일 때 신뢰도

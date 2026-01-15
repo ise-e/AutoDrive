@@ -738,7 +738,7 @@ class CameraPerception:
 
         # 4) Crop top region for fitting stability (keep only nearer region)
         cut = int(self.lane_cut * h)
-        clean_lane[cut:, :] = 0
+        clean_lane[:cut, :] = 0
 
         # 5) Fit lanes
         lfit, rfit = self._fit(clean_lane)
@@ -823,7 +823,7 @@ class CameraPerception:
 
         # 가중치 (앵커 점을 몇 개나 추가할지) - 높을수록 고정력 강함
         # 차가 흔들릴 때 유연성을 주려면 10~20, 강력하게 고정하려면 50 이상
-        ANCHOR_WEIGHT = 30 
+        ANCHOR_WEIGHT = 20 
 
         l_fit_res, r_fit_res = None, None
 

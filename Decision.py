@@ -131,7 +131,7 @@ class CamLane:
         err_pixel = (err_far * cfg.w_cam_far) + (err_near * cfg.w_cam_near)
         
         # 정규화 (도로 폭의 절반을 약 200px로 가정)
-        return max(-1.0, min(1.0, err_pixel / 200.0))
+        return max(-1.0, min(1.0, err_pixel / 140.0))
 
 @dataclass(frozen=True)
 class LidarLane:

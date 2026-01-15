@@ -350,6 +350,8 @@ class CameraPerception:
         wpx_roi = cv2.countNonZero(wmask[y0:y1, :])
         debug_bev = self._debug_line(bev, combined_clean, lfit, rfit, stop, ypx_roi, wpx_roi, stop)
         
+        if self.mstatus == "PARKING":
+            return lfit, rfit, None, debug_bev
         return lfit, rfit, stop, debug_bev
 
     @staticmethod
@@ -557,10 +559,9 @@ class CameraPerception:
         h, w = hsv.shape[:2]
         roi = hsv[0:int(h * 0.4), int(w * 0.2):int(w * 0.8)]
         red = cv2.countNonZero(cv2.bitwise_or(cv2.inRange(roi, *self.RED1), cv2.inRange(roi, *self.RED2)))
-        yel = cv2.countNonZero(cv2.inRange(roi, *self.YELLOW))
         grn = cv2.countNonZero(cv2.inRange(roi, *self.GREEN))
-        best = max((red, "RED"), (yel, "YELLOW"), (grn, "GREEN"))[1]
-        light_result = best if max(red, yel, grn) > 200 else "UNKNOWN"
+        best = max((red, "RED"), (grn, "GREEN"))[1]
+        light_result = best if max(red, grn) > 200 else "UNKNOWN"
         self.pub_tl.publish(light_result)
 
         # ==============DEBUG==============

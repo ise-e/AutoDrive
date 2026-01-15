@@ -597,7 +597,7 @@ class CameraPerception:
                 continue
             dist = (tag * focal) / pw
             ang = float(np.arctan2(float(np.mean(c[:, 0]) - cx), focal))
-            out += [float(ids[i]), dist, ang]
+            out += [float(ids[i][0]), dist, ang] # 오류나면 [0] 없애기
         if out:
             self.pub_ar.publish(Float32MultiArray(data=out))
         return debug_frame

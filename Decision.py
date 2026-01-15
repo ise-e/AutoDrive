@@ -219,6 +219,8 @@ class LegacyScenarioFSM:
 class DecisionNode:
     def __init__(self):
         rospy.init_node("decision_node")
+        
+        rospy.on_shutdown(self._on_shutdown)
 
         gp = lambda n, d: rospy.get_param("~" + n, d)
 
@@ -304,6 +306,20 @@ class DecisionNode:
         self._ts_ar_missing = 0.0
 
         rospy.loginfo("[Decision] Legacy FSM + FSM logs enabled.")
+
+    def _on_shutdown(self) -> None:
+        rospy.loginfo("[Decision] Node is shutting down. Safety stop initiated.")
+        neutral_steer = self.cfg.cen
+        stop_speed = self.cfg.spd_stop
+        
+        msg = Int16MultiArray(data=[int(neutral_steer), int(stop_speed)])
+        
+        # 반복적으로 몇 번 더 보내주면 더 확실하게 멈춥니다.
+        rate = rospy.Rate(10)
+        for _ in range(3):
+            if not rospy.is_shutdown(): # 셧다운 중에도 발행 가능한지 확인
+                self.pub_motor.publish(msg)
+            rospy.sleep(0.1)
 
     # ---------------- Cache update ----------------
     def _up(self, key: str, val: Any, tkey: Optional[str] = None) -> None:

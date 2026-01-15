@@ -310,10 +310,8 @@ class DecisionNode:
 
     def _on_shutdown(self) -> None:
         rospy.loginfo("[Decision] Node is shutting down. Safety stop initiated.")
-        neutral_steer = self.cfg.cen
-        stop_speed = self.cfg.spd_stop
         
-        msg = Int16MultiArray(data=[int(neutral_steer), int(stop_speed)])
+        msg = Int16MultiArray(data=[int(self.cfg.cen), int(self.cfg.spd_stop)])
         
         # 반복적으로 몇 번 더 보내주면 더 확실하게 멈춥니다.
         rate = rospy.Rate(10)

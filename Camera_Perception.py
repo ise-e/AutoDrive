@@ -573,8 +573,7 @@ class CameraPerception:
         return debug_frame
 
     def _ar_tag(self, frame, debug_frame):
-        if not hasattr(cv2, "aruco"):
-            return
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         ar = cv2.aruco
         dic = ar.getPredefinedDictionary(ar.DICT_5X5_1000)

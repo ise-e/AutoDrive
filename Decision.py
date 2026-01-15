@@ -223,7 +223,6 @@ class DecisionNode:
 
         gp = lambda n, d: rospy.get_param("~" + n, d)
 
-        self.prev_
         self.accum_error = 0
         self.prev_error = 0
         self.prev_steer = None
@@ -309,10 +308,8 @@ class DecisionNode:
 
     def _on_shutdown(self) -> None:
         rospy.loginfo("[Decision] Node is shutting down. Safety stop initiated.")
-        neutral_steer = self.cfg.cen
-        stop_speed = self.cfg.spd_stop
         
-        msg = Int16MultiArray(data=[int(neutral_steer), int(stop_speed)])
+        msg = Int16MultiArray(data=[int(90), int(90)])
         
         # 반복적으로 몇 번 더 보내주면 더 확실하게 멈춥니다.
         rate = rospy.Rate(10)
@@ -419,7 +416,7 @@ class DecisionNode:
             speed = 98
             err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
         elif s.lane:
-            y = int(self.cfg.h * 0.8) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+            y = int(self.cfg.h * 0.7) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w)/2.0)
             err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
             THRESHOLD = 300

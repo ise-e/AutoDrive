@@ -227,21 +227,15 @@ class DecisionNode:
         self.accum_error = 0
         self.prev_error = 0
         self.prev_steer = None
-
-        # lane gate / ghost width tracking
-        self._last_lane_width_px = float(getattr(self.cfg, "lane_width_px_init", 342.0))
-        self._last_good_lane: Optional[Lane] = None
-        self._last_good_width_px: float = self._last_lane_width_px
-        self._last_good_t: float = 0.0
-        self._prev_cmd_steer: Optional[int] = None
+        
         # --- config ---
         self.cfg = type("Cfg", (), {
             # steering / speed
             "cen": int(gp("steer_center", 90)),
-            "min": int(gp("steer_min", 45)), ## stable steer
-            "max": int(gp("steer_max", 135)),## stable steer
-            "kp": float(gp("kp_steer", 45.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
-            "kd": float(gp("kd_steer", 15.0)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
+            "min": int(gp("steer_min", 48)), ## stable steer
+            "max": int(gp("steer_max", 132)),## stable steer
+            "kp": float(gp("kp_steer", 200.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.
+            "kd": float(gp("kd_steer", 750)),     ## kd를 조금씩 올립니다. 차가 흔들리는 현상이 줄어들고 부드럽게 라인 중앙으로 복귀하는지 확인합니다. (보통 kd가 주행 안정성에 가장 큰 영향을 줍니다.)
             "ki": float(gp("ki_steer", 0.0001)),     ## 직선 주행 시 차가 중앙에 있지 않고 한쪽으로 쏠린다면 ki를 아주 미세하게 추가합니다. (대부분의 고속 주행에서는 생략 가능합니다.)
             "spd_drive": int(gp("speed_drive", 100)),
             "spd_stop": int(gp("speed_stop", 90)),
@@ -261,18 +255,6 @@ class DecisionNode:
             # lane eval
             "lane_eval_y": float(gp("lane_eval_y", -1.0)),
             "obs_eval_x": float(gp("obs_eval_x", 0.5)),
-
-            # lane sanity gate (conservative safety net)
-            "lane_gate_enable": bool(gp("lane_gate_enable", True)),
-            "lane_width_px_init": float(gp("lane_width_px_init", 342.0)),  # ~0.4m baseline
-            "lane_width_min_px": float(gp("lane_width_min_px", 240.0)),
-            "lane_width_max_px": float(gp("lane_width_max_px", 445.0)),
-            "lane_width_jump_max_px": float(gp("lane_width_jump_max_px", 200.0)),
-            "lane_hold_sec": float(gp("lane_hold_sec", 0.3)),
-
-            # steer slew-rate clamp (deg-like PWM step per loop)
-            "steer_slew_enable": bool(gp("steer_slew_enable", True)),
-            "steer_slew_max_step": int(gp("steer_slew_max_step", 6)),
 
             # parking search (AR 없을 때)
             "park_search_sec": float(gp("park_search_sec", 1.0)),
@@ -345,40 +327,24 @@ class DecisionNode:
             if tkey:
                 self._d[tkey] = now
 
-    
     def _cb_lane(self, m: Float32MultiArray) -> None:
         data = list(m.data) if m.data else []
         n = len(data)
-
-        # evaluation point near bottom for robust width estimation
-        y_eval = int(self.cfg.h * 0.8)
-        center_x = float(self.cfg.w) * 0.5
-
-        width_px = float(getattr(self, "_last_lane_width_px", float(self.cfg.lane_width_px_init)))
-
-        lane: Optional[Lane] = None
-
+        y_eval = 470
+        LINE_WIDTH_PX = 400  # 실제 BEV상 차선 간격 px값에 맞춰 조정 필요
         if n >= 6:
+            # 양쪽 차선 정상 수신
             lane = Lane(data)
-            # update width estimate when both sides are available
-            try:
-                w = self._lane_width_px(lane, y_eval)
-                # 넉넉한 범위에서만 업데이트(대회 직전 보수적)
-                if 150.0 <= w <= 600.0:
-                    self._last_lane_width_px = float(w)
-            except Exception:
-                pass
-
         elif n >= 3:
-            a, b, c = float(data[0]), float(data[1]), float(data[2])
-            target_x = a * (y_eval ** 2) + b * y_eval + c
-
-            # 감지된 곡선이 오른쪽/왼쪽 중 어디로 더 가까운지로 판별 (320 하드코딩 제거)
-            if target_x > center_x:  # right lane curve
-                lane = Lane([a, b, c - width_px, a, b, c])
-            else:  # left lane curve
-                lane = Lane([a, b, c, a, b, c + width_px])
-
+            # 한쪽 차선만 수신 (a, b, c 추출)
+            a, b, c = data[0], data[1], data[2]
+            target_x = a * (y_eval**2) + b * y_eval + c
+            if target_x > 320: # 감지된 것이 오른쪽 차선일 때
+                lane = Lane([a, b, c - LINE_WIDTH_PX, a, b, c])
+            else: # 감지된 것이 왼쪽 차선일 때
+                lane = Lane([a, b, c, a, b, c + LINE_WIDTH_PX])
+        else:
+            lane = None
         self._up("lane", lane)
 
     def _cb_obs_lane(self, m: Float32MultiArray) -> None:
@@ -406,53 +372,11 @@ class DecisionNode:
                 ar=self._d["ar"],
             )
 
-    # ---------------- Lane filtering (conservative safety net) ----------------
-    @staticmethod
-    def _lane_width_px(lane: Lane, y_px: float) -> float:
-        try:
-            lx = lane.x_poly(float(y_px), True)
-            rx = lane.x_poly(float(y_px), False)
-            return float(rx - lx)
-        except Exception:
-            return float("nan")
-
-    def _filter_lane_for_drive(self, lane: Optional[Lane], now_t: float) -> Optional[Lane]:
-        """Return a lane suitable for control. If current is suspicious, fall back to last good."""
-        if lane is None or not bool(getattr(self.cfg, "lane_gate_enable", True)):
-            # allow None, but still use last good within hold window if enabled
-            if bool(getattr(self.cfg, "lane_gate_enable", True)) and self._last_good_lane is not None:
-                if (now_t - self._last_good_t) <= float(self.cfg.lane_hold_sec):
-                    return self._last_good_lane
-            return lane
-
-        y_eval = int(self.cfg.h * 0.8)  # stable evaluation point
-        w = self._lane_width_px(lane, y_eval)
-
-        wmin = float(self.cfg.lane_width_min_px)
-        wmax = float(self.cfg.lane_width_max_px)
-        wjump = float(self.cfg.lane_width_jump_max_px)
-
-        ok = (w == w) and (wmin <= w <= wmax) and (abs(w - float(self._last_good_width_px)) <= wjump)
-
-        if ok:
-            self._last_good_lane = lane
-            self._last_good_width_px = w
-            self._last_good_t = now_t
-            return lane
-
-        # suspicious frame -> fall back to last good if fresh
-        if self._last_good_lane is not None and (now_t - self._last_good_t) <= float(self.cfg.lane_hold_sec):
-            return self._last_good_lane
-
-        return None
-
     # ---------------- Main loop ----------------
     def run(self) -> None:
         rate = rospy.Rate(30)
         while not rospy.is_shutdown():
             s = self._capture()
-            # conservative lane filter: block sudden lane-width glitches
-            s.lane = self._filter_lane_for_drive(s.lane, s.t)
             prev_fsm_state = self.fsm.state
             f = self.fsm.step(s)
 
@@ -494,11 +418,10 @@ class DecisionNode:
             err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
         elif s.lane:
             y = int(self.cfg.h * 0.7) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
-            half_w = max(1.0, float(self.cfg.w) / 2.0)
-
-            # Legacy normalization: [-1.0, 1.0] error (ratio in image space)
-            # + : lane center is to the RIGHT of image center
-            err_norm = (s.lane.x_center(y) - half_w) / half_w
+            half_w = max(1.0, float(self.cfg.w)/2.0)
+            err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
+            THRESHOLD = 300
+            if abs(err_norm/self.cfg.meters_per_pixel_x - self.prev_error/self.cfg.meters_per_pixel_x) > THRESHOLD: err_norm = self.prev_error
         else:
             self.accum_error = 0.0
             self.prev_error = 0.0
@@ -508,7 +431,7 @@ class DecisionNode:
         p_term = err_norm * float(self.cfg.kp)
         d_term = (err_norm - self.prev_error) * float(self.cfg.kd)
         i_term = self.accum_error * float(self.cfg.ki)
-        steer = self.cfg.cen + int(p_term + d_term + i_term)
+        steer = self.cfg.cen - int(p_term + d_term + i_term)
         self.prev_error = err_norm
         steer = self._clamp_i(steer, self.cfg.min, self.cfg.max)
 
@@ -552,17 +475,6 @@ class DecisionNode:
     # ---------------- Publish ----------------
     def _publish(self, steer: int, speed: int, s: Snap, f: FsmOut) -> None:
         steer = self._clamp_i(int(steer), self.cfg.min, self.cfg.max)
-        # conservative slew-rate clamp to prevent one-frame spikes
-        if bool(getattr(self.cfg, "steer_slew_enable", True)):
-            max_step = int(getattr(self.cfg, "steer_slew_max_step", 0))
-            if max_step > 0 and self._prev_cmd_steer is not None:
-                d = int(steer) - int(self._prev_cmd_steer)
-                if d > max_step:
-                    steer = int(self._prev_cmd_steer) + max_step
-                elif d < -max_step:
-                    steer = int(self._prev_cmd_steer) - max_step
-        self._prev_cmd_steer = int(steer)
-
         speed = int(speed)
 
         # motor

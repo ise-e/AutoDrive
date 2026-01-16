@@ -128,7 +128,7 @@ class LegacyScenarioFSM:
             self._ts_white = s.t
             self.white_count += 1
             rospy.loginfo("[FSM] WHITE++ -> %d", self.white_count)
-            if self.white_count >= 2:
+            if self.white_count >= 5:
                 self.mission_direction = "LEFT"
 
         # --- 상태 전이 ---
@@ -416,7 +416,7 @@ class DecisionNode:
             speed = 98
             err_norm = s.obs_lane.x_center(self.cfg.obs_eval_x)
         elif s.lane:
-            y = int(self.cfg.h * 0.7) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
+            y = int(self.cfg.h * 0.75) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w)/2.0)
             err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
             THRESHOLD = 300

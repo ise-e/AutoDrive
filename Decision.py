@@ -477,7 +477,7 @@ class DecisionNode:
             # 현재 시간과 기록된 시간의 차이 계산
             elapsed_time = time.time() - self.stop_timer
             
-            if elapsed_time < 0.5:
+            if elapsed_time < 1.0:
                 # 0.5초가 아직 안 지났으면 -> 계속 주행 (기존 steer, speed 반환)
                 return int(steer), int(speed)
             return int(self.cfg.cen), int(self.cfg.spd_stop)

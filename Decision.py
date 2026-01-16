@@ -232,7 +232,7 @@ class DecisionNode:
         # --- config ---
         self.cfg = type("Cfg", (), {
             # steering / speed
-            "cen": int(gp("steer_center", 90)),
+            "cen": int(gp("steer_center", 88)),
             "min": int(gp("steer_min", 48)), ## stable steer
             "max": int(gp("steer_max", 132)),## stable steer
             "kp": float(gp("kp_steer", 200.0)),  ## ki, kd를 0으로 설정하고 $kp만 올립니다. 차가 라인을 따라가지만 좌우로 흔들리기 시작하는 지점(임계점)을 찾습니다.

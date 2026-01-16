@@ -465,7 +465,8 @@ class DecisionNode:
                 return int(self.cfg.cen), max(int(self.cfg.speed_min_run), int(self.cfg.park_search_speed))
             return int(self.cfg.cen), int(self.cfg.spd_stop)
         """
-        steer, speed = self._drive_cmd(s)
+        steer, _ = self._drive_cmd(s)
+        speed = self.cfg.spd_parking
 
         if s.ar is None:
             return int(steer), int(speed)

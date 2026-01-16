@@ -95,7 +95,7 @@ class CameraPerception:
         self.RED2 = (np.array([160, 100, 100]), np.array([179, 255, 255]))
         self.YELLOW = (np.array([10, 40, 50]), np.array([45, 255, 255]))
         self.GREEN  = (np.array([45, 100, 100]), np.array([90, 255, 255]))
-        self.WHITE  = (np.array([0, 0, 200]),    np.array([179, 40, 255]))
+        self.WHITE  = (np.array([0, 0, 210]), np.array([179, 25, 255]))
 
         # ---------- pubs ----------
         self.pub_lane = rospy.Publisher("/lane_coeffs", Float32MultiArray, queue_size=1)

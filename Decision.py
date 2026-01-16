@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, List
 
 import rospy
+import time
 from std_msgs.msg import Int16MultiArray, String, Float32MultiArray, Float32
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
@@ -226,7 +227,8 @@ class DecisionNode:
         self.accum_error = 0
         self.prev_error = 0
         self.prev_steer = None
-        
+        self.stop_timer = 0
+
         # --- config ---
         self.cfg = type("Cfg", (), {
             # steering / speed
@@ -462,10 +464,16 @@ class DecisionNode:
         if s.ar is None:
             return int(steer), int(speed)
         else:
-            m_dist = s.ar[0]
-            if m_dist <= self.cfg.dist_p + 0.1:
-                return int(self.cfg.cen), int(self.cfg.spd_stop)
-            return int(steer), int(98)
+            if self.stop_timer == 0:
+                self.stop_timer = time.time()
+            
+            # 현재 시간과 기록된 시간의 차이 계산
+            elapsed_time = time.time() - self.stop_timer
+            
+            if elapsed_time < 0.5:
+                # 0.5초가 아직 안 지났으면 -> 계속 주행 (기존 steer, speed 반환)
+                return int(steer), int(speed)
+            return int(self.cfg.cen), int(self.cfg.spd_stop)
             """
             self._ts_ar_missing = 0.0
             dist_m, ang_rad = float(s.ar[0]), float(s.ar[1])

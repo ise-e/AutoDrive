@@ -129,7 +129,7 @@ class LegacyScenarioFSM:
             self._ts_white = s.t
             self.white_count += 1
             rospy.loginfo("[FSM] WHITE++ -> %d", self.white_count)
-            if self.white_count >= 5:
+            if self.white_count >= 3:
                 self.mission_direction = "LEFT"
 
         # --- 상태 전이 ---
@@ -164,7 +164,7 @@ class LegacyScenarioFSM:
 
         if self.state == self.DRIVE_RIGHT:
             # WHITE 2회면 LEFT 주행으로
-            if self.white_count >= 5:
+            if self.white_count >= 3:
                 self.state = self.DRIVE_LEFT
                 out = FsmOut(self.mission_direction, "NONE")
                 if prev_state != self.state:

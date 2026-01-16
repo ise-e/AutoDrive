@@ -198,7 +198,7 @@ class CameraPerception:
             # 너비 변화량 (Width Deviation)
             width_deviation = abs(w_top - w_bot)
             # 차이가 60 이상일 경우 **값 조정 필요
-            if width_deviation > 60 or w_top < 60:
+            if width_deviation > 50 or w_top < 40 or w_bot < 40:
                 get_deriv = lambda f, y: 2 * f[0] * y + f[1]
                 
                 deriv_l = get_deriv(lfit, y_eval)
@@ -381,15 +381,15 @@ class CameraPerception:
         hist = np.sum(binimg[binimg.shape[0] // 2:, :], axis=0)
         mid = len(hist) // 2
 
-        if self.mdir == "RIGHT":
-            lx = self._base(hist, mid - 100, mid + 100, mid // 2)
-            rx = self._base(hist, mid + 150, len(hist), mid + mid // 2)
-        elif self.mdir == "LEFT":
-            lx = self._base(hist, 0, mid - 150, mid // 2)
-            rx = self._base(hist, mid - 100, mid + 100, mid + mid // 2)
-        else:
-            lx = self._base(hist, 0, mid, mid // 2)
-            rx = self._base(hist, mid, len(hist), mid + mid // 2)
+        # if self.mdir == "RIGHT":
+        #     lx = self._base(hist, mid - 100, mid + 100, mid // 2)
+        #     rx = self._base(hist, mid + 150, len(hist), mid + mid // 2)
+        # elif self.mdir == "LEFT":
+        #     lx = self._base(hist, 0, mid - 150, mid // 2)
+        #     rx = self._base(hist, mid - 100, mid + 100, mid + mid // 2)
+        # else:
+        lx = self._base(hist, 0, mid, mid // 2)
+        rx = self._base(hist, mid, len(hist), mid + mid // 2)
 
         nw = max(3, self.nw)
         win_h = binimg.shape[0] // nw

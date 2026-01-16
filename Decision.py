@@ -421,7 +421,7 @@ class DecisionNode:
             y = int(self.cfg.h * 0.7) if (self.cfg.lane_eval_y < 0) else float(self.cfg.lane_eval_y)
             half_w = max(1.0, float(self.cfg.w)/2.0)
             err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
-            THRESHOLD = 300
+            THRESHOLD = 250
             if abs(err_norm/self.cfg.meters_per_pixel_x - self.prev_error/self.cfg.meters_per_pixel_x) > THRESHOLD: 
                 if abs((err_norm/self.cfg.meters_per_pixel_x - 400) - self.prev_error/self.cfg.meters_per_pixel_x) < THRESHOLD:
                     err_norm = err_norm - self.cfg.meters_per_pixel_x * 400

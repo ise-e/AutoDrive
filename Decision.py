@@ -128,7 +128,7 @@ class LegacyScenarioFSM:
             self._ts_white = s.t
             self.white_count += 1
             rospy.loginfo("[FSM] WHITE++ -> %d", self.white_count)
-            if self.white_count >= 5:
+            if self.white_count >= 6:
                 self.mission_direction = "LEFT"
 
         # --- 상태 전이 ---

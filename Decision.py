@@ -423,7 +423,7 @@ class DecisionNode:
             if abs(err_norm/self.cfg.meters_per_pixel_x - self.prev_error/self.cfg.meters_per_pixel_x) > THRESHOLD: 
                 if abs((err_norm/self.cfg.meters_per_pixel_x - 400) - self.prev_error/self.cfg.meters_per_pixel_x) < THRESHOLD:
                     err_norm = err_norm - self.cfg.meters_per_pixel_x * 400
-                if abs((err_norm/self.cfg.meters_per_pixel_x + 400) - self.prev_error/self.cfg.meters_per_pixel_x) < THRESHOLD:
+                elif abs((err_norm/self.cfg.meters_per_pixel_x + 400) - self.prev_error/self.cfg.meters_per_pixel_x) < THRESHOLD:
                     err_norm = err_norm + self.cfg.meters_per_pixel_x * 400
                 else :
                     err_norm = self.prev_error

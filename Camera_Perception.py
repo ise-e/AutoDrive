@@ -381,15 +381,15 @@ class CameraPerception:
         hist = np.sum(binimg[binimg.shape[0] // 2:, :], axis=0)
         mid = len(hist) // 2
 
-        # if self.mdir == "RIGHT":
-        #     lx = self._base(hist, mid - 100, mid + 100, mid // 2)
-        #     rx = self._base(hist, mid + 150, len(hist), mid + mid // 2)
-        # elif self.mdir == "LEFT":
-        #     lx = self._base(hist, 0, mid - 150, mid // 2)
-        #     rx = self._base(hist, mid - 100, mid + 100, mid + mid // 2)
-        # else:
-        lx = self._base(hist, 0, mid, mid // 2)
-        rx = self._base(hist, mid, len(hist), mid + mid // 2)
+        if self.mdir == "RIGHT":
+            lx = self._base(hist, mid - 100, mid + 100, mid // 2)
+            rx = self._base(hist, mid + 200, len(hist), mid + mid // 2)
+        elif self.mdir == "LEFT":
+            lx = self._base(hist, 0, mid - 200, mid // 2)
+            rx = self._base(hist, mid - 100, mid + 100, mid + mid // 2)
+        else:
+            lx = self._base(hist, 0, mid, mid // 2)
+            rx = self._base(hist, mid, len(hist), mid + mid // 2)
 
         nw = max(3, self.nw)
         win_h = binimg.shape[0] // nw

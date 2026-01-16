@@ -129,7 +129,7 @@ class LegacyScenarioFSM:
             self._ts_white = s.t
             self.white_count += 1
             rospy.loginfo("[FSM] WHITE++ -> %d", self.white_count)
-            if self.white_count >= 2:
+            if self.white_count >= 5:
                 self.mission_direction = "LEFT"
 
         # --- 상태 전이 ---
@@ -164,7 +164,7 @@ class LegacyScenarioFSM:
 
         if self.state == self.DRIVE_RIGHT:
             # WHITE 2회면 LEFT 주행으로
-            if self.white_count >= 2:
+            if self.white_count >= 5:
                 self.state = self.DRIVE_LEFT
                 out = FsmOut(self.mission_direction, "NONE")
                 if prev_state != self.state:
@@ -422,7 +422,13 @@ class DecisionNode:
             half_w = max(1.0, float(self.cfg.w)/2.0)
             err_norm = (half_w - s.lane.x_center(y)) * self.cfg.meters_per_pixel_x
             THRESHOLD = 300
-            if abs(err_norm/self.cfg.meters_per_pixel_x - self.prev_error/self.cfg.meters_per_pixel_x) > THRESHOLD: err_norm = self.prev_error
+            if abs(err_norm/self.cfg.meters_per_pixel_x - self.prev_error/self.cfg.meters_per_pixel_x) > THRESHOLD: 
+                if abs((err_norm/self.cfg.meters_per_pixel_x - 400) - self.prev_error/self.cfg.meters_per_pixel_x) < THRESHOLD:
+                    err_norm = err_norm - self.cfg.meters_per_pixel_x * 400
+                elif abs((err_norm/self.cfg.meters_per_pixel_x + 400) - self.prev_error/self.cfg.meters_per_pixel_x) < THRESHOLD:
+                    err_norm = err_norm + self.cfg.meters_per_pixel_x * 400
+                else :
+                    err_norm = self.prev_error
         else:
             self.accum_error = 0.0
             self.prev_error = 0.0

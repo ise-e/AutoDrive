@@ -95,7 +95,7 @@ class CameraPerception:
         self.RED2 = (np.array([160, 100, 100]), np.array([179, 255, 255]))
         self.YELLOW = (np.array([10, 40, 50]), np.array([45, 255, 255]))
         self.GREEN  = (np.array([45, 100, 100]), np.array([90, 255, 255]))
-        self.WHITE  = (np.array([0, 0, 210]), np.array([179, 25, 255]))
+        self.WHITE  = (np.array([0, 0, 200]),    np.array([179, 40, 255]))
 
         # ---------- pubs ----------
         self.pub_lane = rospy.Publisher("/lane_coeffs", Float32MultiArray, queue_size=1)
@@ -259,7 +259,6 @@ class CameraPerception:
         # 1. 마스크 생성 (한 번만)
         ymask = cv2.inRange(hsv, *self.YELLOW)
         wmask = cv2.inRange(hsv, *self.WHITE)
-        wmask = cv2.subtract(wmask, ymask)
         # 정지선용 통합 마스크
         lane_mask = cv2.bitwise_or(ymask, wmask)
         

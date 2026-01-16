@@ -181,6 +181,9 @@ class CameraPerception:
         lfit, rfit, stop, debug_bev = self._lane_stop(bev)
         self.pub_stop.publish(stop)
 
+        def safe_list(fit):
+            return list(fit) if fit is not None else []
+
         # 양쪽 차선 모두 검지
         if lfit is not None and rfit is not None:
             # 이미지 최하단
@@ -203,13 +206,17 @@ class CameraPerception:
 
                 if self.mdir == "LEFT":
                     if (deriv_l - deriv_r) > 0 :
+                        self.last_fit, self.last_fit_t = (lfit, None), now_sec()
                         self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
                     else :
+                        self.last_fit, self.last_fit_t = (None, rfit), now_sec()
                         self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
                 else: # RIGHT 미션
                     if (deriv_l - deriv_r) < 0 :
+                        self.last_fit, self.last_fit_t = (lfit, None), now_sec()
                         self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
                     else :
+                        self.last_fit, self.last_fit_t = (None, rfit), now_sec()
                         self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
             # 정상적인 경우
             else :
@@ -217,15 +224,18 @@ class CameraPerception:
                 self.pub_lane.publish(Float32MultiArray(data=list(lfit) + list(rfit)))
         # 왼쪽만 검지
         elif lfit is not None:
+            self.last_fit, self.last_fit_t = (lfit, None), now_sec()
             self.pub_lane.publish(Float32MultiArray(data=list(lfit)))
         # 오른쪽만 검지
         elif rfit is not None:
+            self.last_fit, self.last_fit_t = (None, rfit), now_sec()
             self.pub_lane.publish(Float32MultiArray(data=list(rfit)))
         # 둘 다 미검지 ** 이 부분은 나중에 판단 노드로 옮길 생각입니다
         else:
             if self.last_fit is not None and (now_sec() - self.last_fit_t) < self.hold_sec:
-                lfit_last, rfit_last = self.last_fit
-                self.pub_lane.publish(Float32MultiArray(data=list(lfit_last) + list(rfit_last)))
+                l_last, r_last = self.last_fit
+                # safe_list를 사용하여 None 에러 방지
+                self.pub_lane.publish(Float32MultiArray(data=safe_list(l_last) + safe_list(r_last)))
             else:
                 self.pub_lane.publish(Float32MultiArray(data=[]))
             

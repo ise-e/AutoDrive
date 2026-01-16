@@ -259,6 +259,7 @@ class CameraPerception:
         # 1. 마스크 생성 (한 번만)
         ymask = cv2.inRange(hsv, *self.YELLOW)
         wmask = cv2.inRange(hsv, *self.WHITE)
+        wmask = cv2.subtract(wmask, ymask)
         # 정지선용 통합 마스크
         lane_mask = cv2.bitwise_or(ymask, wmask)
         

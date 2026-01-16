@@ -163,7 +163,7 @@ class LegacyScenarioFSM:
 
         if self.state == self.DRIVE_RIGHT:
             # WHITE 2회면 LEFT 주행으로
-            if self.white_count >= 2:
+            if self.white_count >= 5:
                 self.state = self.DRIVE_LEFT
                 out = FsmOut(self.mission_direction, "NONE")
                 if prev_state != self.state:
